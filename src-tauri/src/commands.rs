@@ -5,6 +5,7 @@ use crate::logger::LogEntry;
 use crate::clipboard::ClipboardListener;
 use crate::network::NetworkManager;
 use crate::config::AppConfig;
+use crate::protocol::*;
 
 pub struct AppState {
     pub network: Arc<Mutex<NetworkManager>>,
