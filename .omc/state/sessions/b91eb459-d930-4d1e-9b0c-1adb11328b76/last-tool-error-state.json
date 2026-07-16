@@ -1,0 +1,7 @@
+{
+  "tool_name": "Bash",
+  "tool_input_preview": "{\"command\":\"ls \\\"D:\\\\Program Files\\\\Microsoft Visual Studio\\\\\\\" 2>/dev/null || ls \\\"C:\\\\Program Files\\\\Microsoft Visual Studio\\\\\\\" 2>/dev/null\"}",
+  "error": "Exit code 2",
+  "timestamp": "2026-07-15T23:19:12.916Z",
+  "retry_count": 2
+}

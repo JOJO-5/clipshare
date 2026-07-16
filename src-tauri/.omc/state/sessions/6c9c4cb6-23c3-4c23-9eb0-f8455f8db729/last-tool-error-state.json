@@ -1,0 +1,7 @@
+{
+  "tool_name": "Bash",
+  "tool_input_preview": "{\"command\":\"ls /d/mengfanliuFile/dev/clipshare/build.bat 2>/dev/null && echo exists || echo not found\\\"\",\"description\":\"Check if build.bat exists\"}",
+  "error": "Exit code 2\n/usr/bin/bash: eval: line 1: unexpected EOF while looking for matching `\"'",
+  "timestamp": "2026-07-16T14:27:13.686Z",
+  "retry_count": 2
+}

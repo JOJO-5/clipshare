@@ -1,0 +1,7 @@
+{
+  "tool_name": "Bash",
+  "tool_input_preview": "{\"command\":\"grep -n \\\"pub type AppHandle\\\\|pub use\\\" ~/.cargo/registry/src/*/tauri-2.11.5/src/prelude.rs 2>/dev/null\"}",
+  "error": "Exit code 2",
+  "timestamp": "2026-07-16T00:09:11.996Z",
+  "retry_count": 1
+}
