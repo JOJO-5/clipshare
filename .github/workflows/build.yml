@@ -77,7 +77,10 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
-          files: artifacts/**/*.exe
+          files: |
+          artifacts/**/ClipShare*.exe
+          artifacts/**/ClipShare*.app.tar.gz
+          artifacts/**/clipshare
           draft: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
