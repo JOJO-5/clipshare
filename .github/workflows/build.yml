@@ -18,7 +18,7 @@ jobs:
             target: 'x86_64-apple-darwin'
           - platform: 'macos-latest'
             target: 'aarch64-apple-darwin'
-          - platform: 'ubuntu-22.04'
+          - platform: 'ubuntu-24.04'
             target: 'x86_64-unknown-linux-gnu'
 
     runs-on: ${{ matrix.platform }}
@@ -33,10 +33,10 @@ jobs:
           npm ci
 
       - name: Setup (Linux)
-        if: matrix.platform == 'ubuntu-22.04'
+        if: matrix.platform == 'ubuntu-24.04'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.0-dev libappindicator3-dev librsvg2-dev patchelf
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libjavascriptcoregtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libsoup-3.0-dev
           rustup target add ${{ matrix.target }}
           cargo install tauri-cli --locked
           npm ci
@@ -77,7 +77,11 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
-          files: artifacts/**/*.exe
+          files: |
+            artifacts/clipshare-x86_64-pc-windows-msvc/bundle/**/ClipShare*.exe
+            artifacts/clipshare-x86_64-apple-darwin/bundle/**/ClipShare*.app.tar.gz
+            artifacts/clipshare-aarch64-apple-darwin/bundle/**/ClipShare*.app.tar.gz
+            artifacts/clipshare-x86_64-unknown-linux-gnu/clipshare
           draft: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,5 +1,5 @@
-import { useState, useEffect } from 'react'
-import { Form, Radio, Input, InputNumber, Button, Space, message } from 'antd'
+import { useEffect, useState } from 'react'
+import { Button, Form, Input, InputNumber, Radio, Space, message } from 'antd'
 import { invoke } from '@tauri-apps/api/core'
 import { StatusIndicator } from './StatusIndicator'
 
@@ -13,29 +13,22 @@ interface Config {
 
 export function ConfigPanel() {
   const [form] = Form.useForm<Config>()
+  const role = Form.useWatch('role', form)
   const [loading, setLoading] = useState(false)
   const [status, setStatus] = useState('disconnected')
 
   useEffect(() => {
-    loadConfig()
-    const interval = setInterval(() => {
-      invoke<string>('get_connection_status').then(setStatus).catch(() => {})
-    }, 2000)
+    void loadConfig()
+    const interval = setInterval(() => invoke<string>('get_connection_status').then(setStatus).catch(() => {}), 2000)
     return () => clearInterval(interval)
   }, [])
 
   const loadConfig = async () => {
     try {
       const config = await invoke<Config>('get_config')
-      form.setFieldsValue({
-        role: config.role,
-        port: config.port,
-        target_ip: config.target_ip,
-        target_port: config.target_port,
-        max_file_size: config.max_file_size,
-      })
-    } catch (e) {
-      console.error('Failed to load config:', e)
+      form.setFieldsValue(config)
+    } catch (error) {
+      console.error('Failed to load config:', error)
     }
   }
 
@@ -43,34 +36,27 @@ export function ConfigPanel() {
     try {
       const values = form.getFieldsValue()
       await invoke('save_config', {
-        config: {
-          role: values.role,
-          port: values.port,
-          target_ip: values.target_ip || '',
-          target_port: values.target_port,
-          max_file_size: 104857600,
-          language: 'zh-CN',
-        }
+        config: { ...values, target_ip: values.target_ip || '', max_file_size: 104857600, language: 'zh-CN' },
       })
       message.success('配置已保存')
-    } catch (e) {
-      message.error('保存失败: ' + e)
+    } catch (error) {
+      message.error(`保存失败：${error}`)
     }
   }
 
   const handleConnect = async () => {
-    setLoading(true)
     try {
-      const values = form.getFieldsValue()
+      const values = await form.validateFields()
+      setLoading(true)
       if (values.role === 'server') {
         await invoke('start_server', { port: values.port })
-        message.success('服务端已启动')
+        message.success('已开始监听连接')
       } else {
         await invoke('connect_to_server', { ip: values.target_ip, port: values.target_port })
-        message.success('已连接')
+        message.success('已连接到目标设备')
       }
-    } catch (e) {
-      message.error('操作失败: ' + e)
+    } catch (error) {
+      if (error instanceof Error) message.error(`操作失败：${error.message}`)
     } finally {
       setLoading(false)
     }
@@ -78,54 +64,54 @@ export function ConfigPanel() {
 
   const handleDisconnect = async () => {
     await invoke('disconnect')
-    message.info('已断开连接')
+    setStatus('disconnected')
+    message.info('连接已断开')
   }
 
   return (
-    <div style={{ padding: '16px' }}>
-      <Form form={form} layout="vertical" initialValues={{ role: 'server', port: 9527, target_port: 9527, max_file_size: 104857600 }}>
-        <Form.Item name="role" label="运行模式">
-          <Radio.Group>
-            <Radio value="server">服务端（接收剪贴板）</Radio>
-            <Radio value="client">客户端（发送剪贴板）</Radio>
-          </Radio.Group>
-        </Form.Item>
+    <div className="config-panel">
+      <div className="config-scroll">
+        <div className="section-kicker">连接设置</div>
+        <Form form={form} layout="vertical" initialValues={{ role: 'server', port: 9527, target_port: 9527, max_file_size: 104857600 }}>
+          <Form.Item name="role" label="运行模式">
+            <Radio.Group className="role-switch">
+              <Radio.Button value="server">接收端</Radio.Button>
+              <Radio.Button value="client">发送端</Radio.Button>
+            </Radio.Group>
+          </Form.Item>
 
-        <Form.Item name="port" label="监听端口">
-          <InputNumber min={1} max={65535} style={{ width: 200 }} />
-        </Form.Item>
-
-        <Form.Item noStyle shouldUpdate={(prev, curr) => prev.role !== curr.role}>
-          {({ getFieldValue }) =>
-            getFieldValue('role') === 'client' && (
-              <>
-                <Form.Item name="target_ip" label="目标 IP" rules={[{ required: true }]}>
-                  <Input placeholder="例如: 192.168.1.100" style={{ width: 200 }} />
+          <Form.Item noStyle shouldUpdate={(previous, current) => previous.role !== current.role}>
+            {({ getFieldValue }) => getFieldValue('role') === 'server' ? (
+              <Form.Item name="port" label="监听端口" rules={[{ required: true, message: '请输入监听端口' }]}>
+                <InputNumber min={1} max={65535} addonBefore="TCP" className="form-control" />
+              </Form.Item>
+            ) : (
+              <div className="client-fields">
+                <Form.Item name="target_ip" label="目标 IP" rules={[{ required: true, message: '请输入目标 IP' }]}>
+                  <Input placeholder="例如：192.168.1.100" className="form-control" />
                 </Form.Item>
-                <Form.Item name="target_port" label="目标端口">
-                  <InputNumber min={1} max={65535} style={{ width: 200 }} />
+                <Form.Item name="target_port" label="目标端口" rules={[{ required: true, message: '请输入目标端口' }]}>
+                  <InputNumber min={1} max={65535} addonBefore="TCP" className="form-control" />
                 </Form.Item>
-              </>
-            )
-          }
-        </Form.Item>
+              </div>
+            )}
+          </Form.Item>
 
-        <Form.Item name="max_file_size" label="最大文件大小">
-          <InputNumber value={100} disabled suffix="MB" style={{ width: 200 }} />
-        </Form.Item>
-
-        <Space style={{ marginTop: 16 }}>
-          <Button type="primary" onClick={handleConnect} loading={loading}>
-            {form.getFieldValue('role') === 'server' ? '启动监听' : '连接'}
-          </Button>
-          <Button onClick={handleDisconnect}>断开</Button>
+          <Form.Item name="max_file_size" label="文件传输上限">
+            <InputNumber disabled addonAfter="MB" value={100} className="form-control" />
+          </Form.Item>
+        </Form>
+      </div>
+      <footer className="config-actions">
+        <StatusIndicator status={status} />
+        <Space wrap>
           <Button onClick={handleSave}>保存配置</Button>
+          <Button onClick={handleDisconnect}>断开</Button>
+          <Button type="primary" onClick={handleConnect} loading={loading}>
+            {role === 'server' ? '开始监听' : '连接设备'}
+          </Button>
         </Space>
-
-        <div style={{ marginTop: 16 }}>
-          <StatusIndicator status={status} />
-        </div>
-      </Form>
+      </footer>
     </div>
   )
 }

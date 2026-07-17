@@ -1,10 +1,13 @@
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream, Shutdown};
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
 
 use crate::protocol::*;
+
+const MAX_MESSAGE_SIZE: usize = 100 * 1024 * 1024;
 use crate::config::AppConfig;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -19,6 +22,7 @@ pub struct NetworkManager {
     sender: Arc<Mutex<Option<TcpStream>>>,
     receiver: Arc<Mutex<Option<TcpStream>>>,
     config: Arc<Mutex<AppConfig>>,
+    session: Arc<AtomicU64>,
 }
 
 impl NetworkManager {
@@ -28,6 +32,7 @@ impl NetworkManager {
             sender: Arc::new(Mutex::new(None)),
             receiver: Arc::new(Mutex::new(None)),
             config: Arc::new(Mutex::new(AppConfig::load())),
+            session: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -40,6 +45,7 @@ impl NetworkManager {
     }
 
     pub fn disconnect(&self) {
+        self.session.fetch_add(1, Ordering::SeqCst);
         if let Ok(mut s) = self.sender.lock() {
             if let Some(stream) = s.take() {
                 let _ = stream.shutdown(Shutdown::Both);
@@ -53,46 +59,48 @@ impl NetworkManager {
         *self.status.lock().unwrap() = ConnectionStatus::Disconnected;
     }
 
-    fn receive_loop(receiver: Arc<Mutex<Option<TcpStream>>>, status: Arc<Mutex<ConnectionStatus>>, on_receive: Box<dyn Fn(Vec<u8>, u8) + Send + 'static>) {
+    fn receive_loop(
+        mut receiver: TcpStream,
+        status: Arc<Mutex<ConnectionStatus>>,
+        session: Arc<AtomicU64>,
+        session_id: u64,
+        on_receive: Box<dyn Fn(Vec<u8>, u8) + Send + 'static>,
+    ) {
         loop {
-            let header_result = {
-                let mut r = receiver.lock().unwrap();
-                match &mut *r {
-                    Some(s) => {
-                        let mut header_buf = [0u8; HEADER_SIZE];
-                        match s.read_exact(&mut header_buf) {
-                            Ok(()) => {
-                                let mut c = std::io::Cursor::new(&header_buf);
-                                MessageHeader::from_reader(&mut c).ok()
-                            }
-                            Err(_) => None,
-                        }
-                    }
-                    None => None,
-                }
-            };
+            if session.load(Ordering::SeqCst) != session_id {
+                break;
+            }
+
+            let mut header_buf = [0u8; HEADER_SIZE];
+            let header_result = receiver.read_exact(&mut header_buf).and_then(|()| {
+                let mut cursor = std::io::Cursor::new(&header_buf);
+                MessageHeader::from_reader(&mut cursor)
+            });
 
             match header_result {
-                Some(h) => {
+                Ok(h) => {
                     if h.msg_type == TYPE_HEARTBEAT {
                         continue;
                     }
-                    let mut data = vec![0u8; h.data_len as usize];
-                    let read_result = {
-                        let mut r = receiver.lock().unwrap();
-                        match &mut *r {
-                            Some(s) => s.read_exact(&mut data).ok(),
-                            None => None,
+                    if h.data_len as usize > MAX_MESSAGE_SIZE {
+                        if session.load(Ordering::SeqCst) == session_id {
+                            *status.lock().unwrap() = ConnectionStatus::Disconnected;
                         }
-                    };
-                    if read_result.is_none() {
-                        *status.lock().unwrap() = ConnectionStatus::Disconnected;
+                        break;
+                    }
+                    let mut data = vec![0u8; h.data_len as usize];
+                    if receiver.read_exact(&mut data).is_err() {
+                        if session.load(Ordering::SeqCst) == session_id {
+                            *status.lock().unwrap() = ConnectionStatus::Disconnected;
+                        }
                         break;
                     }
                     on_receive(data, h.msg_type);
                 }
-                None => {
-                    *status.lock().unwrap() = ConnectionStatus::Disconnected;
+                Err(_) => {
+                    if session.load(Ordering::SeqCst) == session_id {
+                        *status.lock().unwrap() = ConnectionStatus::Disconnected;
+                    }
                     break;
                 }
             }
@@ -106,28 +114,60 @@ impl NetworkManager {
     {
         self.disconnect();
         *self.status.lock().unwrap() = ConnectionStatus::Connecting;
+        let session_id = self.session.fetch_add(1, Ordering::SeqCst) + 1;
 
         let addr = format!("0.0.0.0:{}", port);
-        let listener = TcpListener::bind(&addr).map_err(|e| e.to_string())?;
-        listener.set_nonblocking(true).map_err(|e| e.to_string())?;
+        let listener = match TcpListener::bind(&addr) {
+            Ok(listener) => listener,
+            Err(error) => {
+                *self.status.lock().unwrap() = ConnectionStatus::Disconnected;
+                return Err(error.to_string());
+            }
+        };
+        if let Err(error) = listener.set_nonblocking(true) {
+            *self.status.lock().unwrap() = ConnectionStatus::Disconnected;
+            return Err(error.to_string());
+        }
 
         let sender = self.sender.clone();
+        let receiver = self.receiver.clone();
         let status = self.status.clone();
+        let session = self.session.clone();
 
         thread::spawn(move || {
-            if let Ok((stream, _)) = listener.accept() {
-                stream.set_nonblocking(false).ok();
-                let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
-                *sender.lock().unwrap() = Some(stream.try_clone().unwrap());
-                *status.lock().unwrap() = ConnectionStatus::Connected;
+            loop {
+                if session.load(Ordering::SeqCst) != session_id {
+                    return;
+                }
+
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        stream.set_nonblocking(false).ok();
+                        let send_stream = match stream.try_clone() {
+                            Ok(stream) => stream,
+                            Err(_) => return,
+                        };
+                        let close_stream = match stream.try_clone() {
+                            Ok(stream) => stream,
+                            Err(_) => return,
+                        };
+                        *sender.lock().unwrap() = Some(send_stream);
+                        *receiver.lock().unwrap() = Some(close_stream);
+                        *status.lock().unwrap() = ConnectionStatus::Connected;
+                        Self::receive_loop(stream, status, session, session_id, Box::new(on_receive));
+                        return;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(100));
+                    }
+                    Err(_) => {
+                        if session.load(Ordering::SeqCst) == session_id {
+                            *status.lock().unwrap() = ConnectionStatus::Disconnected;
+                        }
+                        return;
+                    }
+                }
             }
-        });
-
-        let receiver2 = self.receiver.clone();
-        let status2 = self.status.clone();
-
-        thread::spawn(move || {
-            Self::receive_loop(receiver2, status2, Box::new(on_receive));
         });
 
         Ok(())
@@ -139,27 +179,37 @@ impl NetworkManager {
     {
         self.disconnect();
         *self.status.lock().unwrap() = ConnectionStatus::Connecting;
+        let session_id = self.session.fetch_add(1, Ordering::SeqCst) + 1;
 
         let addr = format!("{}:{}", ip, port);
-        let stream = TcpStream::connect(&addr).map_err(|e| e.to_string())?;
+        let stream = match TcpStream::connect(&addr) {
+            Ok(stream) => stream,
+            Err(error) => {
+                *self.status.lock().unwrap() = ConnectionStatus::Disconnected;
+                return Err(error.to_string());
+            }
+        };
         stream.set_nonblocking(false).ok();
-        let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
-
-        *self.sender.lock().unwrap() = Some(stream.try_clone().unwrap());
-        *self.receiver.lock().unwrap() = Some(stream);
+        let send_stream = stream.try_clone().map_err(|e| e.to_string())?;
+        let close_stream = stream.try_clone().map_err(|e| e.to_string())?;
+        *self.sender.lock().unwrap() = Some(send_stream);
+        *self.receiver.lock().unwrap() = Some(close_stream);
         *self.status.lock().unwrap() = ConnectionStatus::Connected;
 
-        let receiver = self.receiver.clone();
         let status = self.status.clone();
+        let session = self.session.clone();
 
         thread::spawn(move || {
-            Self::receive_loop(receiver, status, Box::new(on_receive));
+            Self::receive_loop(stream, status, session, session_id, Box::new(on_receive));
         });
 
         Ok(())
     }
 
     pub fn send(&self, msg_type: u8, data: &[u8], sequence: u16) -> Result<(), String> {
+        if data.len() > MAX_MESSAGE_SIZE {
+            return Err("Message exceeds the 100 MB transfer limit".to_string());
+        }
         let mut sender = self.sender.lock().unwrap();
         if let Some(ref mut stream) = *sender {
             let header = MessageHeader::new(msg_type, data.len() as u32, sequence);
@@ -176,8 +226,14 @@ impl NetworkManager {
         self.send(TYPE_TEXT, text.as_bytes(), 0)
     }
 
-    pub fn send_image(&self, data: &[u8]) -> Result<(), String> {
-        self.send(TYPE_IMAGE, data, 0)
+    pub fn send_image(&self, width: usize, height: usize, data: &[u8]) -> Result<(), String> {
+        let payload = encode_image(width, height, data)?;
+        self.send(TYPE_IMAGE, &payload, 0)
+    }
+
+    pub fn send_file_data(&self, filename: &str, contents: &[u8]) -> Result<(), String> {
+        let payload = encode_file(filename, contents)?;
+        self.send(TYPE_FILE, &payload, 0)
     }
 
     pub fn send_file(&self, filename: &str, file_size: u64, chunks: impl Iterator<Item = Vec<u8>>) -> Result<(), String> {
@@ -195,4 +251,49 @@ impl NetworkManager {
 
 impl Default for NetworkManager {
     fn default() -> Self { Self::new() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    fn available_port() -> u16 {
+        TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    #[test]
+    fn connected_peers_deliver_text_to_the_remote_callback() {
+        let port = available_port();
+        let server = NetworkManager::new();
+        let client = NetworkManager::new();
+        let (received_tx, received_rx) = mpsc::channel();
+
+        server
+            .start_server(port, move |data, message_type| {
+                received_tx.send((data, message_type)).unwrap();
+            })
+            .unwrap();
+        client
+            .connect_to_server("127.0.0.1", port, |_, _| {})
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while server.get_status() != ConnectionStatus::Connected && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        client.send_text("network delivery check").unwrap();
+
+        assert_eq!(
+            received_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            (b"network delivery check".to_vec(), TYPE_TEXT),
+        );
+        client.disconnect();
+        server.disconnect();
+    }
 }

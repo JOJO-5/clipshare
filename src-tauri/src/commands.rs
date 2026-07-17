@@ -51,9 +51,22 @@ pub fn start_server(port: u16, window: tauri::Window, state: State<AppState>) ->
 
     network.start_server(port, move |data, msg_type| {
         let (data_type, content, size) = match msg_type {
-            TYPE_TEXT => ("text", String::from_utf8_lossy(&data).to_string(), data.len() as u64),
-            TYPE_IMAGE => ("image", "截图".to_string(), data.len() as u64),
-            TYPE_FILE => ("file", "文件".to_string(), data.len() as u64),
+            TYPE_TEXT => {
+                let text = String::from_utf8_lossy(&data).to_string();
+                let _ = crate::clipboard::set_text(&text);
+                ("text", text, data.len() as u64)
+            }
+            TYPE_IMAGE => match decode_image(&data) {
+                Ok((width, height, bytes)) => {
+                    let _ = crate::clipboard::set_image(width, height, bytes);
+                    ("image", "图片".to_string(), data.len() as u64)
+                }
+                Err(error) => ("error", error, 0),
+            },
+            TYPE_FILE => match save_received_file(&data) {
+                Ok(path) => ("file", format!("已保存: {}", path.display()), data.len() as u64),
+                Err(error) => ("error", error, 0),
+            },
             _ => ("", "未知".to_string(), 0),
         };
 
@@ -72,9 +85,22 @@ pub fn connect_to_server(ip: String, port: u16, window: tauri::Window, state: St
 
     network.connect_to_server(&ip, port, move |data, msg_type| {
         let (data_type, content, size) = match msg_type {
-            TYPE_TEXT => ("text", String::from_utf8_lossy(&data).to_string(), data.len() as u64),
-            TYPE_IMAGE => ("image", "截图".to_string(), data.len() as u64),
-            TYPE_FILE => ("file", "文件".to_string(), data.len() as u64),
+            TYPE_TEXT => {
+                let text = String::from_utf8_lossy(&data).to_string();
+                let _ = crate::clipboard::set_text(&text);
+                ("text", text, data.len() as u64)
+            }
+            TYPE_IMAGE => match decode_image(&data) {
+                Ok((width, height, bytes)) => {
+                    let _ = crate::clipboard::set_image(width, height, bytes);
+                    ("image", "图片".to_string(), data.len() as u64)
+                }
+                Err(error) => ("error", error, 0),
+            },
+            TYPE_FILE => match save_received_file(&data) {
+                Ok(path) => ("file", format!("已保存: {}", path.display()), data.len() as u64),
+                Err(error) => ("error", error, 0),
+            },
             _ => ("", "未知".to_string(), 0),
         };
 
@@ -101,9 +127,9 @@ pub fn send_text(text: String, state: State<AppState>) -> Result<(), String> {
 }
 
 #[command]
-pub fn send_image(data: Vec<u8>, state: State<AppState>) -> Result<(), String> {
+pub fn send_image(width: usize, height: usize, data: Vec<u8>, state: State<AppState>) -> Result<(), String> {
     let network = state.network.lock().unwrap();
-    network.send_image(&data)?;
+    network.send_image(width, height, &data)?;
     let entry = LogEntry::send("image", "截图", data.len() as u64);
     entry.write_to_file().ok();
     state.logs.lock().unwrap().push(entry);
@@ -122,6 +148,11 @@ pub fn clear_logs(state: State<AppState>) {
 
 #[command]
 pub fn start_clipboard_monitor(window: tauri::Window, state: State<AppState>) -> Result<(), String> {
+    let mut listener_slot = state.clipboard_listener.lock().unwrap();
+    if listener_slot.is_some() {
+        return Ok(());
+    }
+
     let listener = ClipboardListener::new();
     let logs = Arc::clone(&state.logs);
     let network: Arc<Mutex<NetworkManager>> = Arc::clone(&state.network);
@@ -131,20 +162,76 @@ pub fn start_clipboard_monitor(window: tauri::Window, state: State<AppState>) ->
         let summary = content.summary();
         let size = content.size();
 
-        let entry = LogEntry::send(data_type, &summary, size);
-        entry.write_to_file().ok();
-        logs.lock().unwrap().push(entry.clone());
-        let _ = window.app_handle().emit("clipboard-changed", &entry);
+        let delivered = network
+            .lock()
+            .map_err(|_| "Network state is unavailable".to_string())
+            .and_then(|net| send_clipboard_content(&net, content))
+            .is_ok();
 
-        if let Ok(net) = network.lock() {
-            match content {
-                crate::clipboard::ClipboardContent::Text(t) => { net.send_text(&t).ok(); }
-                crate::clipboard::ClipboardContent::Image(b) => { net.send_image(&b).ok(); }
-                crate::clipboard::ClipboardContent::Files(_) => { }
-            }
+        if delivered {
+            let entry = LogEntry::send(data_type, &summary, size);
+            entry.write_to_file().ok();
+            logs.lock().unwrap().push(entry.clone());
+            let _ = window.app_handle().emit("clipboard-changed", &entry);
         }
+        delivered
     });
 
-    *state.clipboard_listener.lock().unwrap() = Some(listener);
+    *listener_slot = Some(listener);
     Ok(())
+}
+
+fn send_clipboard_content(
+    network: &NetworkManager,
+    content: crate::clipboard::ClipboardContent,
+) -> Result<(), String> {
+    if network.get_status() != ConnectionStatus::Connected {
+        return Err("Not connected".to_string());
+    }
+
+    match content {
+        crate::clipboard::ClipboardContent::Text(text) => network.send_text(&text),
+        crate::clipboard::ClipboardContent::Image { width, height, bytes } => {
+            network.send_image(width, height, &bytes)
+        }
+        crate::clipboard::ClipboardContent::Files(paths) => {
+            for path in paths {
+                let file = std::path::Path::new(&path);
+                let name = file
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .ok_or_else(|| "Invalid file name".to_string())?;
+                let contents = std::fs::read(file).map_err(|error| error.to_string())?;
+                network.send_file_data(name, &contents)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn save_received_file(payload: &[u8]) -> Result<std::path::PathBuf, String> {
+    let (filename, contents) = decode_file(payload)?;
+    let directory = dirs::download_dir()
+        .unwrap_or_else(|| AppConfig::config_dir().join("downloads"))
+        .join("ClipShare");
+    std::fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+    let target = directory.join(filename);
+    std::fs::write(&target, contents).map_err(|error| error.to_string())?;
+    Ok(target)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clipboard_content_is_not_marked_delivered_when_peer_is_disconnected() {
+        let network = NetworkManager::new();
+
+        assert!(send_clipboard_content(
+            &network,
+            crate::clipboard::ClipboardContent::Text("pending transfer".to_string()),
+        )
+        .is_err());
+    }
 }
