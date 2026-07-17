@@ -1,9 +1,6 @@
-import { useState, useEffect } from 'react'
 import { List, Tag, Button } from 'antd'
-import { invoke } from '@tauri-apps/api/core'
-import { listen } from '@tauri-apps/api/event'
 
-interface LogEntry {
+export interface LogEntry {
   time: string
   type: string
   dataType: string
@@ -23,31 +20,12 @@ const dataTypeIcons: Record<string, string> = {
   file: '📁',
 }
 
-export function LogPanel() {
-  const [logs, setLogs] = useState<LogEntry[]>([])
+interface LogPanelProps {
+  logs: LogEntry[]
+  onClear: () => void | Promise<void>
+}
 
-  useEffect(() => {
-    invoke<LogEntry[]>('get_logs').then(setLogs).catch(console.error)
-    invoke('start_clipboard_monitor').catch(console.error)
-
-    const unlisten1 = listen<LogEntry>('clipboard-changed', (event) => {
-      setLogs(prev => [...prev.slice(-499), event.payload])
-    })
-
-    const unlisten2 = listen<LogEntry>('clipboard-received', (event) => {
-      setLogs(prev => [...prev.slice(-499), event.payload])
-    })
-
-    return () => {
-      unlisten1.then(fn => fn())
-      unlisten2.then(fn => fn())
-    }
-  }, [])
-
-  const handleClear = () => {
-    invoke('clear_logs')
-    setLogs([])
-  }
+export function LogPanel({ logs, onClear }: LogPanelProps) {
 
   const formatTime = (iso: string) => {
     const d = new Date(iso)
@@ -88,7 +66,7 @@ export function LogPanel() {
         )}
         locale={{ emptyText: '暂无日志' }}
       />
-      <Button onClick={handleClear} style={{ marginTop: 8 }}>清空日志</Button>
+      <Button onClick={onClear} style={{ marginTop: 8 }}>清空日志</Button>
     </div>
   )
 }

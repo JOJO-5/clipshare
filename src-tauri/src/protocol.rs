@@ -1,4 +1,4 @@
-use std::io::{Read, Write};
+use std::io::Read;
 
 pub const MAGIC: u32 = 0x434C4950;
 pub const TYPE_TEXT: u8 = 0x01;
@@ -83,7 +83,58 @@ impl FileMetadata {
     pub fn from_slice(slice: &[u8]) -> Option<Self> {
         let null_pos = slice.iter().position(|&b| b == 0)?;
         let filename = String::from_utf8(slice[..null_pos].to_vec()).ok()?;
-        let file_size = u64::from_be_bytes(slice[null_pos + 1..null_pos + 9].try_into().ok()?);
+        let size_bytes = slice.get(null_pos + 1..null_pos + 9)?;
+        let file_size = u64::from_be_bytes(size_bytes.try_into().ok()?);
         Some(Self { filename, file_size })
     }
+}
+
+pub fn encode_file(filename: &str, contents: &[u8]) -> Result<Vec<u8>, String> {
+    let name = std::path::Path::new(filename)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| "Invalid file name".to_string())?;
+    let size = u64::try_from(contents.len()).map_err(|_| "File is too large")?;
+    let metadata = FileMetadata { filename: name.to_string(), file_size: size };
+    let mut payload = metadata.to_bytes();
+    payload.extend_from_slice(contents);
+    Ok(payload)
+}
+
+pub fn decode_file(payload: &[u8]) -> Result<(String, Vec<u8>), String> {
+    let separator = payload.iter().position(|byte| *byte == 0).ok_or_else(|| "File metadata is incomplete".to_string())?;
+    let metadata_end = separator.checked_add(9).ok_or_else(|| "File metadata is invalid".to_string())?;
+    let metadata = FileMetadata::from_slice(payload).ok_or_else(|| "File metadata is invalid".to_string())?;
+    let contents = payload.get(metadata_end..).ok_or_else(|| "File payload is incomplete".to_string())?;
+    if metadata.file_size != contents.len() as u64 {
+        return Err("File payload size does not match metadata".to_string());
+    }
+    Ok((metadata.filename, contents.to_vec()))
+}
+
+pub fn encode_image(width: usize, height: usize, bytes: &[u8]) -> Result<Vec<u8>, String> {
+    if width == 0 || height == 0 || bytes.len() != width.saturating_mul(height).saturating_mul(4) {
+        return Err("Invalid RGBA image payload".to_string());
+    }
+    let width = u32::try_from(width).map_err(|_| "Image width is too large")?;
+    let height = u32::try_from(height).map_err(|_| "Image height is too large")?;
+    let mut payload = Vec::with_capacity(8 + bytes.len());
+    payload.extend_from_slice(&width.to_be_bytes());
+    payload.extend_from_slice(&height.to_be_bytes());
+    payload.extend_from_slice(bytes);
+    Ok(payload)
+}
+
+pub fn decode_image(payload: &[u8]) -> Result<(usize, usize, Vec<u8>), String> {
+    if payload.len() < 8 {
+        return Err("Image payload is incomplete".to_string());
+    }
+    let width = u32::from_be_bytes(payload[0..4].try_into().unwrap()) as usize;
+    let height = u32::from_be_bytes(payload[4..8].try_into().unwrap()) as usize;
+    let bytes = payload[8..].to_vec();
+    if width == 0 || height == 0 || bytes.len() != width.saturating_mul(height).saturating_mul(4) {
+        return Err("Image payload is invalid".to_string());
+    }
+    Ok((width, height, bytes))
 }

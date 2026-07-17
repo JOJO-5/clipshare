@@ -78,10 +78,10 @@ jobs:
         uses: softprops/action-gh-release@v1
         with:
           files: |
-          artifacts/clipshare-x86_64-pc-windows-msvc/bundle/**/ClipShare*.exe
-          artifacts/clipshare-x86_64-apple-darwin/bundle/**/ClipShare*.app.tar.gz
-          artifacts/clipshare-aarch64-apple-darwin/bundle/**/ClipShare*.app.tar.gz
-          artifacts/clipshare-x86_64-unknown-linux-gnu/clipshare
+            artifacts/clipshare-x86_64-pc-windows-msvc/bundle/**/ClipShare*.exe
+            artifacts/clipshare-x86_64-apple-darwin/bundle/**/ClipShare*.app.tar.gz
+            artifacts/clipshare-aarch64-apple-darwin/bundle/**/ClipShare*.app.tar.gz
+            artifacts/clipshare-x86_64-unknown-linux-gnu/clipshare
           draft: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
