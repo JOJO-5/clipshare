@@ -71,6 +71,8 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
+          retention-days: 3
+          if-no-files-found: error
           path: |
             src-tauri/target/${{ matrix.target }}/release/bundle/**/*
             src-tauri/target/${{ matrix.target }}/release/clipshare*
@@ -92,11 +94,13 @@ jobs:
         uses: softprops/action-gh-release@v1
         with:
           files: |
-            artifacts/clipshare-win7-x64/**
-            artifacts/clipshare-windows-x64/**
-            artifacts/clipshare-macos-x64/**
-            artifacts/clipshare-macos-arm64/**
-            artifacts/clipshare-linux-x64/**
+            artifacts/**/*.exe
+            artifacts/**/*.msi
+            artifacts/**/*.dmg
+            artifacts/**/*.app.tar.gz
+            artifacts/**/*.deb
+            artifacts/**/*.AppImage
+            artifacts/**/clipshare
           draft: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
