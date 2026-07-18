@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - master
+      - 'agent/**'
     tags:
       - 'v*'
   workflow_dispatch:
@@ -59,9 +60,8 @@ jobs:
         with:
           name: clipshare-${{ matrix.target }}
           path: |
-            src-tauri/target/${{ matrix.target }}/release/bundle/**/ClipShare*.exe
-            src-tauri/target/${{ matrix.target }}/release/bundle/**/ClipShare*.app.tar.gz
-            src-tauri/target/${{ matrix.target }}/release/clipshare
+            src-tauri/target/${{ matrix.target }}/release/bundle/**/*
+            src-tauri/target/${{ matrix.target }}/release/clipshare*
 
   release:
     needs: build

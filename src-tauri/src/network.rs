@@ -226,6 +226,11 @@ impl NetworkManager {
         self.send(TYPE_TEXT, text.as_bytes(), 0)
     }
 
+    pub fn send_wechat(&self, message: &WeChatMessage) -> Result<(), String> {
+        let payload = encode_wechat(message)?;
+        self.send(TYPE_WECHAT, &payload, 0)
+    }
+
     pub fn send_image(&self, width: usize, height: usize, data: &[u8]) -> Result<(), String> {
         let payload = encode_image(width, height, data)?;
         self.send(TYPE_IMAGE, &payload, 0)
@@ -293,6 +298,45 @@ mod tests {
             received_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
             (b"network delivery check".to_vec(), TYPE_TEXT),
         );
+        client.disconnect();
+        server.disconnect();
+    }
+
+    #[test]
+    fn connected_peers_deliver_wechat_messages_to_the_remote_callback() {
+        let port = available_port();
+        let server = NetworkManager::new();
+        let client = NetworkManager::new();
+        let (received_tx, received_rx) = mpsc::channel();
+
+        server
+            .start_server(port, move |data, message_type| {
+                received_tx.send((data, message_type)).unwrap();
+            })
+            .unwrap();
+        client
+            .connect_to_server("127.0.0.1", port, |_, _| {})
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while server.get_status() != ConnectionStatus::Connected && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let message = WeChatMessage {
+            id: "network-msg".to_string(),
+            sender: "张三".to_string(),
+            preview: "预览".to_string(),
+            content: "完整消息".to_string(),
+            timestamp: 1_700_000_000,
+            unread_count: 1,
+        };
+        client.send_wechat(&message).unwrap();
+
+        let (data, message_type) = received_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(message_type, TYPE_WECHAT);
+        assert_eq!(decode_wechat(&data).unwrap(), message);
+
         client.disconnect();
         server.disconnect();
     }

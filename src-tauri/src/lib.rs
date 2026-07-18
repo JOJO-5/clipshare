@@ -4,6 +4,8 @@ pub mod config;
 pub mod logger;
 pub mod network;
 pub mod protocol;
+pub mod wechat;
+pub mod wechat_monitor;
 
 use commands::*;
 use tauri::{
@@ -15,6 +17,7 @@ use tauri::{
 
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_notification::init())
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
             get_config,
@@ -24,10 +27,12 @@ pub fn run() {
             connect_to_server,
             disconnect,
             send_text,
+            send_wechat,
             send_image,
             get_logs,
             clear_logs,
             start_clipboard_monitor,
+            start_wechat_monitor,
         ])
         .setup(|app| {
             // Build tray icon menu

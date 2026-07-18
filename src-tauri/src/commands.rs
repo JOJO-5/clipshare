@@ -6,11 +6,13 @@ use crate::clipboard::ClipboardListener;
 use crate::network::NetworkManager;
 use crate::config::AppConfig;
 use crate::protocol::*;
+use crate::wechat_monitor::WeChatMonitor;
 
 pub struct AppState {
     pub network: Arc<Mutex<NetworkManager>>,
     pub logs: Arc<Mutex<Vec<LogEntry>>>,
     pub clipboard_listener: Mutex<Option<ClipboardListener>>,
+    pub wechat_monitor: Mutex<Option<WeChatMonitor>>,
 }
 
 impl Default for AppState {
@@ -19,6 +21,7 @@ impl Default for AppState {
             network: Arc::new(Mutex::new(NetworkManager::new())),
             logs: Arc::new(Mutex::new(Vec::new())),
             clipboard_listener: Mutex::new(None),
+            wechat_monitor: Mutex::new(None),
         }
     }
 }
@@ -67,6 +70,10 @@ pub fn start_server(port: u16, window: tauri::Window, state: State<AppState>) ->
                 Ok(path) => ("file", format!("已保存: {}", path.display()), data.len() as u64),
                 Err(error) => ("error", error, 0),
             },
+            TYPE_WECHAT => match decode_wechat(&data) {
+                Ok(message) => ("wechat", message.preview, data.len() as u64),
+                Err(error) => ("error", error, 0),
+            },
             _ => ("", "未知".to_string(), 0),
         };
 
@@ -74,6 +81,11 @@ pub fn start_server(port: u16, window: tauri::Window, state: State<AppState>) ->
         entry.write_to_file().ok();
         logs.lock().unwrap().push(entry.clone());
         let _ = window_clone.app_handle().emit("clipboard-received", &entry);
+        if msg_type == TYPE_WECHAT {
+            if let Ok(message) = decode_wechat(&data) {
+                let _ = window_clone.app_handle().emit("wechat-received", &message);
+            }
+        }
     })
 }
 
@@ -101,6 +113,10 @@ pub fn connect_to_server(ip: String, port: u16, window: tauri::Window, state: St
                 Ok(path) => ("file", format!("已保存: {}", path.display()), data.len() as u64),
                 Err(error) => ("error", error, 0),
             },
+            TYPE_WECHAT => match decode_wechat(&data) {
+                Ok(message) => ("wechat", message.preview, data.len() as u64),
+                Err(error) => ("error", error, 0),
+            },
             _ => ("", "未知".to_string(), 0),
         };
 
@@ -108,6 +124,11 @@ pub fn connect_to_server(ip: String, port: u16, window: tauri::Window, state: St
         entry.write_to_file().ok();
         logs.lock().unwrap().push(entry.clone());
         let _ = window_clone.app_handle().emit("clipboard-received", &entry);
+        if msg_type == TYPE_WECHAT {
+            if let Ok(message) = decode_wechat(&data) {
+                let _ = window_clone.app_handle().emit("wechat-received", &message);
+            }
+        }
     })
 }
 
@@ -123,6 +144,52 @@ pub fn send_text(text: String, state: State<AppState>) -> Result<(), String> {
     let entry = LogEntry::send("text", &text, text.len() as u64);
     entry.write_to_file().ok();
     state.logs.lock().unwrap().push(entry);
+    Ok(())
+}
+
+#[command]
+pub fn send_wechat(message: WeChatMessage, state: State<AppState>) -> Result<(), String> {
+    let network = state.network.lock().unwrap();
+    network.send_wechat(&message)?;
+    let entry = LogEntry::send("wechat", &message.preview, message.content.len() as u64);
+    entry.write_to_file().ok();
+    state.logs.lock().unwrap().push(entry);
+    Ok(())
+}
+
+#[command]
+pub fn start_wechat_monitor(window: tauri::Window, state: State<AppState>) -> Result<(), String> {
+    let mut monitor_slot = state.wechat_monitor.lock().unwrap();
+    if monitor_slot.is_some() {
+        return Ok(());
+    }
+
+    let logs = Arc::clone(&state.logs);
+    let network = Arc::clone(&state.network);
+    let window_clone = window.clone();
+    let monitor = WeChatMonitor::start(move |message| {
+        let message = prepare_wechat_message(message, 40);
+        let delivered = network
+            .lock()
+            .map_err(|_| "Network state is unavailable".to_string())
+            .and_then(|net| {
+                if net.get_status() != ConnectionStatus::Connected {
+                    return Err("Not connected".to_string());
+                }
+                net.send_wechat(&message)
+            })
+            .is_ok();
+
+        if delivered {
+            let entry = LogEntry::send("wechat", &message.preview, message.content.len() as u64);
+            entry.write_to_file().ok();
+            logs.lock().unwrap().push(entry);
+            let _ = window_clone.app_handle().emit("wechat-sent", &message);
+        }
+        delivered
+    })?;
+
+    *monitor_slot = Some(monitor);
     Ok(())
 }
 

@@ -10,7 +10,16 @@ pub struct AppConfig {
     pub target_port: u16,
     pub max_file_size: u64,
     pub language: String,
+    #[serde(default = "default_true")]
+    pub wechat_enabled: bool,
+    #[serde(default = "default_preview_limit")]
+    pub wechat_preview_limit: usize,
+    #[serde(default)]
+    pub wechat_show_content: bool,
 }
+
+fn default_true() -> bool { true }
+fn default_preview_limit() -> usize { 40 }
 
 impl Default for AppConfig {
     fn default() -> Self {
@@ -21,6 +30,9 @@ impl Default for AppConfig {
             target_port: 9527,
             max_file_size: 104857600,
             language: "zh-CN".to_string(),
+            wechat_enabled: true,
+            wechat_preview_limit: 40,
+            wechat_show_content: true,
         }
     }
 }
@@ -56,5 +68,22 @@ impl AppConfig {
         let content = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
         fs::write(Self::config_path(), content).map_err(|e| e.to_string())?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_config_gets_wechat_defaults() {
+        let config: AppConfig = serde_json::from_str(
+            r#"{"role":"server","port":9527,"target_ip":"","target_port":9527,"max_file_size":104857600,"language":"zh-CN"}"#,
+        )
+        .unwrap();
+
+        assert!(config.wechat_enabled);
+        assert_eq!(config.wechat_preview_limit, 40);
+        assert!(!config.wechat_show_content);
     }
 }

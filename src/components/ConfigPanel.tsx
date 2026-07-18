@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Button, Form, Input, InputNumber, Radio, Space, message } from 'antd'
+import { Button, Form, Input, InputNumber, Radio, Space, Switch, message } from 'antd'
 import { invoke } from '@tauri-apps/api/core'
 import { StatusIndicator } from './StatusIndicator'
 
@@ -9,6 +9,9 @@ interface Config {
   target_ip: string
   target_port: number
   max_file_size: number
+  wechat_enabled: boolean
+  wechat_preview_limit: number
+  wechat_show_content: boolean
 }
 
 export function ConfigPanel() {
@@ -72,7 +75,7 @@ export function ConfigPanel() {
     <div className="config-panel">
       <div className="config-scroll">
         <div className="section-kicker">连接设置</div>
-        <Form form={form} layout="vertical" initialValues={{ role: 'server', port: 9527, target_port: 9527, max_file_size: 104857600 }}>
+        <Form form={form} layout="vertical" initialValues={{ role: 'server', port: 9527, target_port: 9527, max_file_size: 104857600, wechat_enabled: true, wechat_preview_limit: 40, wechat_show_content: true }}>
           <Form.Item name="role" label="运行模式">
             <Radio.Group className="role-switch">
               <Radio.Button value="server">接收端</Radio.Button>
@@ -99,6 +102,16 @@ export function ConfigPanel() {
 
           <Form.Item name="max_file_size" label="文件传输上限">
             <InputNumber disabled addonAfter="MB" value={100} className="form-control" />
+          </Form.Item>
+          <div className="section-kicker">微信消息提示</div>
+          <Form.Item name="wechat_enabled" label="启用微信消息提示" valuePropName="checked">
+            <Switch />
+          </Form.Item>
+          <Form.Item name="wechat_preview_limit" label="通知摘要长度">
+            <InputNumber min={1} max={200} addonAfter="字" className="form-control" />
+          </Form.Item>
+          <Form.Item name="wechat_show_content" label="点击后显示完整正文" valuePropName="checked">
+            <Switch />
           </Form.Item>
         </Form>
       </div>
