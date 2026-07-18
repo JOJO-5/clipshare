@@ -17,12 +17,24 @@ jobs:
         include:
           - platform: 'windows-latest'
             target: 'x86_64-pc-windows-msvc'
+            config: 'src-tauri/tauri.win7.conf.json'
+            artifact: 'clipshare-win7-x64'
+          - platform: 'windows-latest'
+            target: 'x86_64-pc-windows-msvc'
+            config: 'src-tauri/tauri.modern.conf.json'
+            artifact: 'clipshare-windows-x64'
           - platform: 'macos-latest'
             target: 'x86_64-apple-darwin'
+            config: ''
+            artifact: 'clipshare-macos-x64'
           - platform: 'macos-latest'
             target: 'aarch64-apple-darwin'
+            config: ''
+            artifact: 'clipshare-macos-arm64'
           - platform: 'ubuntu-24.04'
             target: 'x86_64-unknown-linux-gnu'
+            config: ''
+            artifact: 'clipshare-linux-x64'
 
     runs-on: ${{ matrix.platform }}
     steps:
@@ -53,12 +65,12 @@ jobs:
 
       - name: Build
         run: |
-          npm run tauri build -- --target ${{ matrix.target }}
+          npm run tauri build -- --target ${{ matrix.target }} ${{ matrix.config != '' && format('--config {0}', matrix.config) || '' }}
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: clipshare-${{ matrix.target }}
+          name: ${{ matrix.artifact }}
           path: |
             src-tauri/target/${{ matrix.target }}/release/bundle/**/*
             src-tauri/target/${{ matrix.target }}/release/clipshare*
@@ -80,10 +92,11 @@ jobs:
         uses: softprops/action-gh-release@v1
         with:
           files: |
-            artifacts/clipshare-x86_64-pc-windows-msvc/bundle/**/ClipShare*.exe
-            artifacts/clipshare-x86_64-apple-darwin/bundle/**/ClipShare*.app.tar.gz
-            artifacts/clipshare-aarch64-apple-darwin/bundle/**/ClipShare*.app.tar.gz
-            artifacts/clipshare-x86_64-unknown-linux-gnu/clipshare
+            artifacts/clipshare-win7-x64/**
+            artifacts/clipshare-windows-x64/**
+            artifacts/clipshare-macos-x64/**
+            artifacts/clipshare-macos-arm64/**
+            artifacts/clipshare-linux-x64/**
           draft: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
