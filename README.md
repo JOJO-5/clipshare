@@ -1,36 +1,45 @@
 # ClipShare
 
-ClipShare 是一个面向局域网的剪贴板共享工具，使用 Tauri、React、TypeScript 和 Rust 构建。两台设备连接后，可以在设备之间同步文本、图片和文件。
+ClipShare 是一个面向局域网的剪贴板共享工具，使用 Tauri、React、TypeScript 和 Rust 构建。连接后，设备之间可以实时同步文本、图片和文件。
 
 ## 功能
 
-- 文本剪贴板实时同步
-- RGBA 图片传输与接收写回剪贴板
-- 文件剪贴板传输，接收文件保存到 `下载/ClipShare`
-- TCP 连接状态显示、断线处理和传输日志
-- 支持监听端和主动连接端两种工作模式
+- 文本、RGBA 图片和文件实时传输
+- TCP 服务端/客户端两种工作模式
+- 连接状态和传输日志
+- 微信消息提示：Win7 端监听微信 UI 文本，Win10/11 端显示系统通知
+- 通知显示短摘要，点击后查看完整微信消息
 - 单条消息最大传输大小为 100 MB
+
+## 系统兼容性
+
+- Windows 7：使用独立的 `ClipShare Win7` 构建包，安装器嵌入 WebView2 Bootstrapper
+- Windows 10/11：使用 `ClipShare` 构建包，使用系统或在线安装的 WebView2
+- macOS：Intel 和 Apple Silicon
+- Linux：x64
+
+Win7 微信监听依赖 Windows UI Automation。不同微信版本的 UI 控件结构可能不同；如果微信没有暴露正文文本，程序会跳过该次快照，避免发送错误消息。华为云桌面需要保持用户会话运行，注销或没有交互桌面时监听可能暂停。
 
 ## 开发环境
 
 - Node.js 20+
 - Rust stable toolchain
-- Windows 开发需要 Visual Studio 2022 C++ 桌面开发工具和 WebView2
-- Tauri 2.x 所需的系统依赖
+- Windows 开发需要 Visual Studio 2022 C++ 桌面开发工具
+- Windows 运行和打包需要 WebView2 相关运行时
 
-安装前端依赖：
+安装依赖：
 
 ```bash
 npm install
 ```
 
-开发模式：
+启动开发环境：
 
 ```bash
 npm run tauri dev
 ```
 
-## 构建
+## 本地构建
 
 构建前端：
 
@@ -38,51 +47,64 @@ npm run tauri dev
 npm run build
 ```
 
-构建 Tauri 安装包：
+构建默认 Tauri 包：
 
 ```bash
 npm run tauri build
 ```
 
-Windows 也可以使用仓库中的脚本：
+构建独立 Windows 包：
 
-```bat
-build-full.bat
+```bash
+npm run tauri build -- --config src-tauri/tauri.win7.conf.json
+npm run tauri build -- --config src-tauri/tauri.modern.conf.json
 ```
 
-构建产物位于 `src-tauri/target/release/bundle/`，包括 MSI 和 NSIS 安装包。
+构建产物位于 `src-tauri/target/release/bundle/`。
 
 ## 测试
 
-运行 Rust 单元和网络回归测试：
+运行 Rust 单元测试和网络测试：
 
 ```bash
 cd src-tauri
 cargo test --lib
 ```
 
-前端类型检查和生产构建：
+检查前端类型并构建：
 
 ```bash
 npm run build
 ```
 
+## GitHub Actions 和下载
+
+推送 `v*` tag 会触发多平台构建，并自动创建 Draft Release。构建产物包括：
+
+- `clipshare-win7-x64`
+- `clipshare-windows-x64`
+- `clipshare-macos-x64`
+- `clipshare-macos-arm64`
+- `clipshare-linux-x64`
+
+正式安装包请从 GitHub 的 [Releases](https://github.com/JOJO-5/clipshare/releases) 下载；Actions artifact 仅作为短期构建结果保留。
+
 ## 使用方式
 
-1. 在设备 A 选择“接收端”，设置监听端口并开始监听。
-2. 在设备 B 选择“发送端”，填写设备 A 的局域网 IP 和端口，然后连接设备。
-3. 连接状态显示为“在线”后，复制文本、图片或文件即可传输。
-4. 在“传输日志”页查看发送和接收记录。
+1. 设备 A 选择“接收端”，设置监听端口并开始监听。
+2. 设备 B 选择“发送端”，填写设备 A 的局域网 IP 和端口，然后连接。
+3. 连接成功后，复制文本、图片或文件即可传输。
+4. 启用微信消息提示后，Win7 端检测到微信新消息会发送到监听端，Win10/11 端显示通知。
 
 默认端口为 `9527`。使用局域网 IP 连接时，请确保防火墙允许该端口的 TCP 入站连接。
 
 ## 项目结构
 
 ```text
-src/                  React 界面和日志展示
-src-tauri/src/        Rust 命令、剪贴板、TCP 网络和协议实现
-src-tauri/tauri.conf.json  Tauri 窗口和打包配置
-.github/workflows/    多平台构建工作流
+src/                         React 界面、配置和日志展示
+src-tauri/src/               Rust 命令、剪贴板、TCP 协议和微信监听
+src-tauri/tauri.conf.json    默认 Tauri 窗口和打包配置
+src-tauri/tauri.win7.conf.json   Win7 flavor 配置
+src-tauri/tauri.modern.conf.json Win10/11 flavor 配置
+.github/workflows/           多平台构建和 Release 工作流
 ```
-
-当前主要在 Windows 环境验证。非 Windows 平台的剪贴板写入和监听仍需要补充对应平台实现。
