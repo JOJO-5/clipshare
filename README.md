@@ -13,7 +13,7 @@ ClipShare 是一个面向局域网的剪贴板共享工具，使用 Tauri、Reac
 
 ## 系统兼容性
 
-- Windows 7：使用独立的 `ClipShare Win7` 构建包，安装器嵌入 WebView2 Bootstrapper
+- Windows 7：使用独立的 `ClipShare Win7` 可执行文件，采用 Rust 官方 `x86_64-win7-windows-msvc` target 构建；运行前需准备兼容的 WebView2 运行时
 - Windows 10/11：使用 `ClipShare` 构建包，使用系统或在线安装的 WebView2
 - macOS：Intel 和 Apple Silicon
 - Linux：x64
@@ -53,14 +53,22 @@ npm run build
 npm run tauri build
 ```
 
-构建独立 Windows 包：
+构建现代 Windows 包：
 
 ```bash
-npm run tauri build -- --config src-tauri/tauri.win7.conf.json
 npm run tauri build -- --config src-tauri/tauri.modern.conf.json
 ```
 
-构建产物位于 `src-tauri/target/release/bundle/`。
+Win7 包需要 nightly Rust、`rust-src` 和官方 Win7 target 的 `build-std`：
+
+```bash
+rustup toolchain install nightly --profile minimal --component rust-src
+$env:RUSTUP_TOOLCHAIN = "nightly"
+npm run build
+cargo build --manifest-path src-tauri/Cargo.toml --release --target x86_64-win7-windows-msvc --bin clipshare
+```
+
+现代 Windows 构建产物位于 `src-tauri/target/release/bundle/`；Win7 构建产物为 `src-tauri/target/x86_64-win7-windows-msvc/release/clipshare.exe`。
 
 ## 测试
 
