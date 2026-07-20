@@ -75,16 +75,26 @@ jobs:
           cargo install tauri-cli --locked
           npm ci
 
-      - name: Build
+      - name: Build (Win7)
+        if: matrix.win7 == true
+        shell: pwsh
         run: |
-          if ('${{ matrix.win7 }}' -eq 'true') {
-            $env:RUSTUP_TOOLCHAIN = 'nightly'
-            npm run build
-            $env:TAURI_CONFIG = Get-Content -Raw src-tauri/tauri.win7.conf.json
-            cargo build --manifest-path src-tauri/Cargo.toml --release --target ${{ matrix.target }} --bin clipshare --locked
-          } else {
-            npm run tauri build -- --target ${{ matrix.target }} ${{ matrix.config != '' && format('--config {0}', matrix.config) || '' }}
-          }
+          $env:RUSTUP_TOOLCHAIN = 'nightly'
+          npm run build
+          $env:TAURI_CONFIG = Get-Content -Raw src-tauri/tauri.win7.conf.json
+          cargo build --manifest-path src-tauri/Cargo.toml --release --target ${{ matrix.target }} --bin clipshare --locked
+
+      - name: Build (Windows)
+        if: matrix.platform == 'windows-latest' && matrix.win7 == false
+        shell: pwsh
+        run: |
+          npm run tauri build -- --target ${{ matrix.target }} --config ${{ matrix.config }}
+
+      - name: Build (Unix)
+        if: matrix.platform != 'windows-latest'
+        shell: bash
+        run: |
+          npm run tauri build -- --target ${{ matrix.target }}
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
