@@ -15,12 +15,13 @@ if ($installMode.path -notmatch 'webview2-runtime') {
 
 $workflow = Get-Content -LiteralPath $workflowPath -Raw
 foreach ($requiredText in @(
-    'Microsoft.WebView2.FixedVersionRuntime.109.0.1518.78.x64.cab',
+    'webview2.runtime.x64.109.0.1518.78.nupkg',
     'cargo build --manifest-path src-tauri/Cargo.toml',
     'tauri bundle',
     'x86_64-pc-windows-msvc',
     '--features win7-compat',
-    'webview2-runtime'
+    'webview2-runtime',
+    'Expand-Archive'
 )) {
     if ($workflow -notlike "*$requiredText*") {
         throw "Win7 workflow is missing '$requiredText'."

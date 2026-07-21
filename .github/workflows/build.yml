@@ -81,20 +81,19 @@ jobs:
         run: |
           $env:RUSTUP_TOOLCHAIN = 'nightly'
           $webviewVersion = '109.0.1518.78'
-          $webviewUrl = 'https://msedge.sf.dl.delivery.mp.microsoft.com/filestreamingservice/files/e97607f4-c5f1-4684-95c3-c61555f08f19/Microsoft.WebView2.FixedVersionRuntime.109.0.1518.78.x64.cab'
-          $webviewCab = Join-Path $env:RUNNER_TEMP "Microsoft.WebView2.FixedVersionRuntime.$webviewVersion.x64.cab"
+          $webviewUrl = 'https://api.nuget.org/v3-flatcontainer/webview2.runtime.x64/109.0.1518.78/webview2.runtime.x64.109.0.1518.78.nupkg'
+          $webviewPackage = Join-Path $env:RUNNER_TEMP "webview2.runtime.x64.$webviewVersion.zip"
+          $webviewExtract = Join-Path $env:RUNNER_TEMP "webview2-runtime-$webviewVersion"
           $webviewDir = Join-Path $pwd 'src-tauri\webview2-runtime'
           New-Item -ItemType Directory -Force -Path $webviewDir | Out-Null
-          Invoke-WebRequest -UseBasicParsing -Uri $webviewUrl -OutFile $webviewCab
-          & expand.exe $webviewCab -F:* $webviewDir
-          if ($LASTEXITCODE -ne 0) {
-            throw "Failed to extract WebView2 fixed runtime ($LASTEXITCODE)."
+          Invoke-WebRequest -UseBasicParsing -MaximumRedirection 5 -Uri $webviewUrl -OutFile $webviewPackage
+          Expand-Archive -LiteralPath $webviewPackage -DestinationPath $webviewExtract -Force
+          $webviewExecutable = Get-ChildItem -LiteralPath $webviewExtract -Recurse -File -Filter 'msedgewebview2.exe' | Select-Object -First 1
+          if ($null -eq $webviewExecutable) {
+            throw "WebView2 fixed runtime package does not contain msedgewebview2.exe."
           }
-          $webviewExecutable = Join-Path $webviewDir 'msedgewebview2.exe'
-          if (-not (Test-Path -LiteralPath $webviewExecutable)) {
-            throw "WebView2 fixed runtime is missing $webviewExecutable."
-          }
-          $runtimeProductVersion = (Get-Item -LiteralPath $webviewExecutable).VersionInfo.ProductVersion
+          Copy-Item -LiteralPath (Join-Path $webviewExecutable.Directory.FullName '*') -Destination $webviewDir -Recurse -Force
+          $runtimeProductVersion = $webviewExecutable.VersionInfo.ProductVersion
           if ($runtimeProductVersion -notlike '109.*') {
             throw "Expected WebView2 109 runtime, found $runtimeProductVersion."
           }
