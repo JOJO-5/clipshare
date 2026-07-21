@@ -80,6 +80,7 @@ jobs:
         shell: pwsh
         run: |
           $env:RUSTUP_TOOLCHAIN = 'nightly'
+          npm run build
           $webviewVersion = '109.0.1518.78'
           $webviewUrl = 'https://api.nuget.org/v3-flatcontainer/webview2.runtime.x64/109.0.1518.78/webview2.runtime.x64.109.0.1518.78.nupkg'
           $webviewPackage = Join-Path $env:RUNNER_TEMP "webview2.runtime.x64.$webviewVersion.zip"
