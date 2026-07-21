@@ -23,5 +23,8 @@ if ($workflow -match 'cargo install tauri-cli') {
 if ($packageJson -notmatch '"@tauri-apps/cli"') {
     throw 'CI must install the Tauri CLI through package-lock via npm ci.'
 }
+if ($workflow -notmatch 'timeout-minutes:\s*30') {
+    throw 'Each CI build job must have a finite timeout.'
+}
 
 Write-Output 'Functional regression contracts are present.'
