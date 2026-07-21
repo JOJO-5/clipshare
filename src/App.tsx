@@ -37,6 +37,7 @@ function App() {
     let stopChanged: (() => void) | undefined
     let stopReceived: (() => void) | undefined
     let stopWeChat: (() => void) | undefined
+    let stopWeChatMonitorLog: (() => void) | undefined
     let stopNotificationAction: (() => void) | undefined
     const appendLog = (entry: LogEntry) => setLogs(prev => [...prev.slice(-499), entry])
 
@@ -62,7 +63,7 @@ function App() {
         stopNotificationAction = undefined
       }
 
-      const [changed, received, wechat] = await Promise.all([
+      const [changed, received, wechat, wechatMonitorLog] = await Promise.all([
         listen<LogEntry>('clipboard-changed', event => appendLog(event.payload)),
         listen<LogEntry>('clipboard-received', event => {
           if (event.payload.dataType !== 'wechat') appendLog(event.payload)
@@ -95,16 +96,19 @@ function App() {
             })
           }
         }),
+        listen<LogEntry>('wechat-monitor-log', event => appendLog(event.payload)),
       ])
       if (disposed) {
         changed()
         received()
         wechat()
+        wechatMonitorLog()
         return
       }
       stopChanged = changed
       stopReceived = received
       stopWeChat = wechat
+      stopWeChatMonitorLog = wechatMonitorLog
 
       try {
         const initialLogs = await invoke<LogEntry[]>('get_logs')
@@ -123,6 +127,7 @@ function App() {
       stopChanged?.()
       stopReceived?.()
       stopWeChat?.()
+      stopWeChatMonitorLog?.()
       stopNotificationAction?.()
     }
   }, [notificationApi])

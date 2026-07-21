@@ -46,6 +46,17 @@ impl LogEntry {
         }
     }
 
+    pub fn info(data_type: &str, content: &str) -> Self {
+        Self {
+            time: Local::now().format("%Y-%m-%dT%H:%M:%S%.3f").to_string(),
+            log_type: "info".to_string(),
+            data_type: data_type.to_string(),
+            content: content.to_string(),
+            size: 0,
+        }
+    }
+
+
     pub fn log_file_path() -> PathBuf {
         let today = Local::now().format("%Y-%m-%d").to_string();
         crate::config::AppConfig::logs_dir().join(format!("{}.jsonl", today))
@@ -67,5 +78,20 @@ impl LogEntry {
         writeln!(writer, "{}", json).map_err(|e| e.to_string())?;
         writer.flush().map_err(|e| e.to_string())?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn info_entries_are_visible_as_diagnostic_logs() {
+        let entry = LogEntry::info("wechat-monitor", "UIA initialized");
+
+        assert_eq!(entry.log_type, "info");
+        assert_eq!(entry.data_type, "wechat-monitor");
+        assert_eq!(entry.content, "UIA initialized");
+        assert_eq!(entry.size, 0);
     }
 }

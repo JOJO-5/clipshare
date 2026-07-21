@@ -5,7 +5,7 @@ use std::sync::{
     Arc,
 };
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UiMessageNode {
@@ -13,6 +13,32 @@ pub struct UiMessageNode {
     pub sender: String,
     pub content: String,
     pub incoming: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct UiScanSummary {
+    windows: usize,
+    lists: usize,
+    items: usize,
+    parsed_nodes: usize,
+    incoming_nodes: usize,
+    text_nodes: usize,
+    messages: usize,
+}
+
+impl UiScanSummary {
+    fn format_log(&self) -> String {
+        format!(
+            "wechat-ui windows={} lists={} items={} parsed={} incoming={} text_nodes={} messages={}",
+            self.windows,
+            self.lists,
+            self.items,
+            self.parsed_nodes,
+            self.incoming_nodes,
+            self.text_nodes,
+            self.messages,
+        )
+    }
 }
 
 pub fn messages_from_nodes(nodes: &[UiMessageNode]) -> Vec<WeChatMessage> {
@@ -111,9 +137,10 @@ pub struct WeChatMonitor {
 }
 
 impl WeChatMonitor {
-    pub fn start<F>(on_message: F) -> Result<Self, String>
+    pub fn start<F, D>(on_message: F, on_diagnostic: D) -> Result<Self, String>
     where
         F: Fn(WeChatMessage) -> bool + Send + 'static,
+        D: Fn(String) + Send + 'static,
     {
         #[cfg(windows)]
         {
@@ -122,12 +149,36 @@ impl WeChatMonitor {
             thread::spawn(move || {
                 let automation = match uiautomation::UIAutomation::new() {
                     Ok(automation) => automation,
-                    Err(_) => return,
+                    Err(error) => {
+                        on_diagnostic(format!("wechat-monitor UIA initialization failed: {error}"));
+                        return;
+                    }
                 };
+                on_diagnostic("wechat-monitor UIA initialized".to_string());
                 let mut tracker = MessageTracker::default();
+                let mut last_summary = None;
+                let mut last_summary_log = Instant::now() - Duration::from_secs(5);
+                let mut last_pending_log = Instant::now() - Duration::from_secs(5);
 
                 while !thread_stop.load(Ordering::Relaxed) {
-                    for message in tracker.ingest(scan_wechat(&automation)) {
+                    let (messages, summary) = scan_wechat(&automation);
+                    if last_summary.as_ref() != Some(&summary)
+                        || last_summary_log.elapsed() >= Duration::from_secs(5)
+                    {
+                        on_diagnostic(summary.format_log());
+                        last_summary = Some(summary);
+                        last_summary_log = Instant::now();
+                    }
+
+                    let pending = tracker.ingest(messages);
+                    if !pending.is_empty() && last_pending_log.elapsed() >= Duration::from_secs(5) {
+                        on_diagnostic(format!(
+                            "wechat-monitor incoming messages pending_delivery={}",
+                            pending.len()
+                        ));
+                        last_pending_log = Instant::now();
+                    }
+                    for message in pending {
                         if on_message(message.clone()) {
                             tracker.mark_delivered(&message.id);
                         }
@@ -141,6 +192,7 @@ impl WeChatMonitor {
         #[cfg(not(windows))]
         {
             let _ = on_message;
+            let _ = on_diagnostic;
             Err("微信监听仅支持 Windows".to_string())
         }
     }
@@ -153,13 +205,26 @@ impl Drop for WeChatMonitor {
 }
 
 #[cfg(windows)]
-fn scan_wechat(automation: &uiautomation::UIAutomation) -> Vec<WeChatMessage> {
+fn scan_wechat(
+    automation: &uiautomation::UIAutomation,
+) -> (Vec<WeChatMessage>, UiScanSummary) {
     let windows = find_wechat_windows(automation);
+    let mut summary = UiScanSummary {
+        windows: windows.len(),
+        ..UiScanSummary::default()
+    };
     let mut messages = Vec::new();
     for window in windows {
-        messages.extend(scan_wechat_window(automation, &window));
+        let (window_messages, window_summary) = scan_wechat_window(automation, &window);
+        summary.lists += window_summary.lists;
+        summary.items += window_summary.items;
+        summary.parsed_nodes += window_summary.parsed_nodes;
+        summary.incoming_nodes += window_summary.incoming_nodes;
+        summary.text_nodes += window_summary.text_nodes;
+        messages.extend(window_messages);
     }
-    messages
+    summary.messages = messages.len();
+    (messages, summary)
 }
 
 #[cfg(windows)]
@@ -245,10 +310,10 @@ fn find_wechat_windows(automation: &uiautomation::UIAutomation) -> Vec<uiautomat
 fn scan_wechat_window(
     automation: &uiautomation::UIAutomation,
     window: &uiautomation::UIElement,
-) -> Vec<WeChatMessage> {
+) -> (Vec<WeChatMessage>, UiScanSummary) {
     let walker = match automation.get_control_view_walker() {
         Ok(walker) => walker,
-        Err(_) => return Vec::new(),
+        Err(_) => return (Vec::new(), UiScanSummary::default()),
     };
     let lists = automation
         .create_matcher()
@@ -260,17 +325,41 @@ fn scan_wechat_window(
         .unwrap_or_default();
 
     if !lists.is_empty() {
-        let nodes = lists
+        let list_count = lists.len();
+        let items = lists
             .into_iter()
             .flat_map(|list| walker.get_children(&list).unwrap_or_default())
+            .collect::<Vec<_>>();
+        let item_count = items.len();
+        let nodes = items
+            .into_iter()
             .filter_map(|item| parse_message_item(automation, &item))
             .collect::<Vec<_>>();
-        return messages_from_nodes(&nodes);
+        let messages = messages_from_nodes(&nodes);
+        return (
+            messages.clone(),
+            UiScanSummary {
+                lists: list_count,
+                items: item_count,
+                parsed_nodes: nodes.len(),
+                incoming_nodes: nodes.iter().filter(|node| node.incoming).count(),
+                messages: messages.len(),
+                ..UiScanSummary::default()
+            },
+        );
     }
 
     let mut texts = Vec::new();
     collect_ui_text(&walker, window, &mut texts);
-    extract_latest_message(&texts).into_iter().collect()
+    let messages = extract_latest_message(&texts).into_iter().collect::<Vec<_>>();
+    (
+        messages.clone(),
+        UiScanSummary {
+            text_nodes: texts.len(),
+            messages: messages.len(),
+            ..UiScanSummary::default()
+        },
+    )
 }
 
 #[cfg(windows)]
@@ -381,6 +470,24 @@ mod tests {
 
         assert_eq!(message.sender, "张三");
         assert_eq!(message.content, "这是最新消息");
+    }
+
+    #[test]
+    fn formats_ui_scan_summary_with_message_counts() {
+        let summary = UiScanSummary {
+            windows: 1,
+            lists: 2,
+            items: 8,
+            parsed_nodes: 6,
+            incoming_nodes: 3,
+            text_nodes: 0,
+            messages: 3,
+        };
+
+        assert_eq!(
+            summary.format_log(),
+            "wechat-ui windows=1 lists=2 items=8 parsed=6 incoming=3 text_nodes=0 messages=3"
+        );
     }
 
     #[test]

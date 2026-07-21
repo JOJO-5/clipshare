@@ -12,6 +12,7 @@ const typeColors: Record<string, string> = {
   send: 'blue',
   recv: 'green',
   error: 'red',
+  info: 'cyan',
 }
 
 const dataTypeIcons: Record<string, string> = {

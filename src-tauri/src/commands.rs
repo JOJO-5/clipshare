@@ -168,6 +168,10 @@ pub fn send_wechat(message: WeChatMessage, state: State<AppState>) -> Result<(),
 pub fn start_wechat_monitor(window: tauri::Window, state: State<AppState>) -> Result<(), String> {
     let config = AppConfig::load();
     if !config.wechat_enabled {
+        let entry = LogEntry::info("wechat-monitor", "wechat-monitor disabled by config");
+        entry.write_to_file().ok();
+        state.logs.lock().unwrap().push(entry.clone());
+        let _ = window.app_handle().emit("wechat-monitor-log", &entry);
         return Ok(());
     }
 
@@ -177,30 +181,42 @@ pub fn start_wechat_monitor(window: tauri::Window, state: State<AppState>) -> Re
     }
 
     let logs = Arc::clone(&state.logs);
+    let diagnostic_logs = Arc::clone(&state.logs);
     let network = Arc::clone(&state.network);
     let window_clone = window.clone();
+    let diagnostic_window = window.clone();
     let preview_limit = config.wechat_preview_limit.max(1);
-    let monitor = WeChatMonitor::start(move |message| {
-        let message = prepare_wechat_message(message, preview_limit);
-        let delivered = network
-            .lock()
-            .map_err(|_| "Network state is unavailable".to_string())
-            .and_then(|net| {
-                if net.get_status() != ConnectionStatus::Connected {
-                    return Err("Not connected".to_string());
-                }
-                net.send_wechat(&message)
-            })
-            .is_ok();
+    let monitor = WeChatMonitor::start(
+        move |message| {
+            let message = prepare_wechat_message(message, preview_limit);
+            let delivered = network
+                .lock()
+                .map_err(|_| "Network state is unavailable".to_string())
+                .and_then(|net| {
+                    if net.get_status() != ConnectionStatus::Connected {
+                        return Err("Not connected".to_string());
+                    }
+                    net.send_wechat(&message)
+                })
+                .is_ok();
 
-        if delivered {
-            let entry = LogEntry::send("wechat", &message.preview, message.content.len() as u64);
+            if delivered {
+                let entry = LogEntry::send("wechat", &message.preview, message.content.len() as u64);
+                entry.write_to_file().ok();
+                logs.lock().unwrap().push(entry);
+                let _ = window_clone.app_handle().emit("wechat-sent", &message);
+            }
+            delivered
+        },
+        move |diagnostic| {
+            let entry = LogEntry::info("wechat-monitor", &diagnostic);
             entry.write_to_file().ok();
-            logs.lock().unwrap().push(entry);
-            let _ = window_clone.app_handle().emit("wechat-sent", &message);
-        }
-        delivered
-    })?;
+            diagnostic_logs.lock().unwrap().push(entry.clone());
+            let _ = diagnostic_window
+                .app_handle()
+                .emit("wechat-monitor-log", &entry);
+        },
+    )?;
 
     *monitor_slot = Some(monitor);
     Ok(())
