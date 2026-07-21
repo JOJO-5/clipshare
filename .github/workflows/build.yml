@@ -80,9 +80,30 @@ jobs:
         shell: pwsh
         run: |
           $env:RUSTUP_TOOLCHAIN = 'nightly'
-          npm run build
+          $webviewVersion = '109.0.1518.78'
+          $webviewUrl = 'https://msedge.sf.dl.delivery.mp.microsoft.com/filestreamingservice/files/e97607f4-c5f1-4684-95c3-c61555f08f19/Microsoft.WebView2.FixedVersionRuntime.109.0.1518.78.x64.cab'
+          $webviewCab = Join-Path $env:RUNNER_TEMP "Microsoft.WebView2.FixedVersionRuntime.$webviewVersion.x64.cab"
+          $webviewDir = Join-Path $pwd 'src-tauri\webview2-runtime'
+          New-Item -ItemType Directory -Force -Path $webviewDir | Out-Null
+          Invoke-WebRequest -UseBasicParsing -Uri $webviewUrl -OutFile $webviewCab
+          & expand.exe $webviewCab -F:* $webviewDir
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to extract WebView2 fixed runtime ($LASTEXITCODE)."
+          }
+          $webviewExecutable = Join-Path $webviewDir 'msedgewebview2.exe'
+          if (-not (Test-Path -LiteralPath $webviewExecutable)) {
+            throw "WebView2 fixed runtime is missing $webviewExecutable."
+          }
+          $runtimeProductVersion = (Get-Item -LiteralPath $webviewExecutable).VersionInfo.ProductVersion
+          if ($runtimeProductVersion -notlike '109.*') {
+            throw "Expected WebView2 109 runtime, found $runtimeProductVersion."
+          }
           $env:TAURI_CONFIG = Get-Content -Raw src-tauri/tauri.win7.conf.json
           cargo build --manifest-path src-tauri/Cargo.toml --release --target ${{ matrix.target }} --bin clipshare --features win7-compat --locked
+          $bundleTargetDir = 'src-tauri\target\x86_64-pc-windows-msvc\release'
+          New-Item -ItemType Directory -Force -Path $bundleTargetDir | Out-Null
+          Copy-Item -LiteralPath "src-tauri\target\${{ matrix.target }}\release\clipshare.exe" -Destination (Join-Path $bundleTargetDir 'clipshare.exe') -Force
+          npm run tauri bundle -- --target x86_64-pc-windows-msvc --config src-tauri/tauri.win7.conf.json --features win7-compat --bundles nsis --ci --no-sign
 
       - name: Build (Windows)
         if: matrix.platform == 'windows-latest' && matrix.win7 == false
@@ -96,7 +117,19 @@ jobs:
         run: |
           npm run tauri build -- --target ${{ matrix.target }}
 
+      - name: Upload Win7 artifacts
+        if: matrix.win7 == true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          retention-days: 3
+          if-no-files-found: error
+          path: |
+            src-tauri/target/x86_64-pc-windows-msvc/release/bundle/**/*
+            src-tauri/target/${{ matrix.target }}/release/clipshare*
+
       - name: Upload artifacts
+        if: matrix.win7 == false
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}

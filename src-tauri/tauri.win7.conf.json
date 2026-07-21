@@ -5,7 +5,8 @@
   "bundle": {
     "windows": {
       "webviewInstallMode": {
-        "type": "embedBootstrapper"
+        "type": "fixedRuntime",
+        "path": "./webview2-runtime"
       }
     }
   }
