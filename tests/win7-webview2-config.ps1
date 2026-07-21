@@ -28,4 +28,12 @@ foreach ($requiredText in @(
     }
 }
 
+$unsafeWildcardCopy = "Copy-Item -LiteralPath (Join-Path `$webviewExecutable.Directory.FullName '*')"
+if ($workflow.Contains($unsafeWildcardCopy)) {
+    throw 'Win7 workflow must not pass a wildcard through Copy-Item -LiteralPath.'
+}
+if (-not $workflow.Contains('Get-ChildItem -LiteralPath $webviewExecutable.Directory.FullName -Force | ForEach-Object')) {
+    throw 'Win7 workflow must enumerate the fixed runtime directory before copying its contents.'
+}
+
 Write-Output 'Win7 WebView2 configuration is valid.'

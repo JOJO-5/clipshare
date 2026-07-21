@@ -92,7 +92,9 @@ jobs:
           if ($null -eq $webviewExecutable) {
             throw "WebView2 fixed runtime package does not contain msedgewebview2.exe."
           }
-          Copy-Item -LiteralPath (Join-Path $webviewExecutable.Directory.FullName '*') -Destination $webviewDir -Recurse -Force
+          Get-ChildItem -LiteralPath $webviewExecutable.Directory.FullName -Force | ForEach-Object {
+            Copy-Item -LiteralPath $_.FullName -Destination $webviewDir -Recurse -Force
+          }
           $runtimeProductVersion = $webviewExecutable.VersionInfo.ProductVersion
           if ($runtimeProductVersion -notlike '109.*') {
             throw "Expected WebView2 109 runtime, found $runtimeProductVersion."
