@@ -73,7 +73,7 @@ export function ConfigPanel() {
         message.success('已开始监听连接')
       } else {
         await invoke('connect_to_server', { ip: values.target_ip, port: values.target_port })
-        message.success('已连接到目标设备')
+        message.success('已开始连接，目标设备上线后会自动重连')
       }
     } catch (error) {
       if (error instanceof Error) message.error(`操作失败：${error.message}`)

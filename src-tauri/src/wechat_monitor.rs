@@ -1,5 +1,5 @@
 use crate::wechat::WeChatMessage;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -27,6 +27,7 @@ struct UiScanSummary {
     incoming_nodes: usize,
     text_nodes: usize,
     messages: usize,
+    tree_diagnostic: Option<String>,
 }
 
 impl UiScanSummary {
@@ -130,6 +131,10 @@ fn select_latest_messages<T>(items: &[T], count: usize) -> &[T] {
 
 fn should_scan_wechat_fallback(summary: &UiScanSummary) -> bool {
     summary.parsed_nodes == 0 && summary.messages == 0 && summary.unread_sessions == 0
+}
+
+fn should_emit_tree_diagnostic(previous: Option<&str>, current: Option<&str>) -> bool {
+    current.is_some() && previous != current
 }
 
 pub fn messages_from_nodes(nodes: &[UiMessageNode]) -> Vec<WeChatMessage> {
@@ -248,6 +253,7 @@ impl WeChatMonitor {
                 on_diagnostic("wechat-monitor UIA initialized".to_string());
                 let mut tracker = MessageTracker::default();
                 let mut last_summary = None;
+                let mut last_tree_diagnostic = None;
                 let mut last_summary_log = Instant::now() - Duration::from_secs(5);
                 let mut last_pending_log = Instant::now() - Duration::from_secs(5);
 
@@ -257,8 +263,17 @@ impl WeChatMonitor {
                         || last_summary_log.elapsed() >= Duration::from_secs(5)
                     {
                         on_diagnostic(summary.format_log());
-                        last_summary = Some(summary);
+                        last_summary = Some(summary.clone());
                         last_summary_log = Instant::now();
+                    }
+                    if should_emit_tree_diagnostic(
+                        last_tree_diagnostic.as_deref(),
+                        summary.tree_diagnostic.as_deref(),
+                    ) {
+                        if let Some(diagnostic) = summary.tree_diagnostic.clone() {
+                            on_diagnostic(diagnostic.clone());
+                            last_tree_diagnostic = Some(diagnostic);
+                        }
                     }
 
                     let pending = tracker.ingest(messages);
@@ -330,6 +345,9 @@ fn merge_scan_summary(target: &mut UiScanSummary, source: &UiScanSummary) {
     target.parsed_nodes += source.parsed_nodes;
     target.incoming_nodes += source.incoming_nodes;
     target.text_nodes += source.text_nodes;
+    if target.tree_diagnostic.is_none() {
+        target.tree_diagnostic = source.tree_diagnostic.clone();
+    }
 }
 
 #[cfg(windows)]
@@ -432,14 +450,28 @@ fn scan_wechat_window(
         Ok(walker) => walker,
         Err(_) => return (Vec::new(), UiScanSummary::default()),
     };
-    let lists = automation
+    let mut lists = automation
         .create_matcher()
         .from_ref(window)
         .control_type(uiautomation::controls::ControlType::List)
-        .depth(12)
+        .depth(32)
         .timeout(100)
         .find_all()
         .unwrap_or_default();
+
+    // wxauto obtains the main layout and then asks the session/chat boxes for
+    // their ListControl children. Some Win7 WeChat builds do not return these
+    // controls through a filtered matcher, while the control-view walker can
+    // still enumerate them. Keep the matcher fast path, then use the walker
+    // as the equivalent direct-tree fallback.
+    if lists.is_empty() {
+        lists = collect_ui_descendants(&walker, window, 1200)
+            .into_iter()
+            .filter(|element| {
+                element.get_control_type().ok() == Some(uiautomation::controls::ControlType::List)
+            })
+            .collect();
+    }
 
     if !lists.is_empty() {
         let items = lists
@@ -497,6 +529,8 @@ fn scan_wechat_window(
                 parsed_nodes: nodes.len(),
                 incoming_nodes: nodes.iter().filter(|node| node.incoming).count(),
                 messages: messages.len(),
+                tree_diagnostic: (nodes.is_empty() && unread_sessions == 0)
+                    .then(|| format_ui_tree_diagnostic(&walker, window)),
                 ..UiScanSummary::default()
             },
         );
@@ -512,8 +546,98 @@ fn scan_wechat_window(
         UiScanSummary {
             text_nodes: texts.len(),
             messages: messages.len(),
+            tree_diagnostic: Some(format_ui_tree_diagnostic(&walker, window)),
             ..UiScanSummary::default()
         },
+    )
+}
+
+#[cfg(windows)]
+fn collect_ui_descendants(
+    walker: &uiautomation::UITreeWalker,
+    root: &uiautomation::UIElement,
+    limit: usize,
+) -> Vec<uiautomation::UIElement> {
+    let mut queue = VecDeque::from(walker.get_children(root).unwrap_or_default());
+    let mut elements = Vec::new();
+
+    while let Some(element) = queue.pop_front() {
+        if elements.len() >= limit {
+            break;
+        }
+        queue.extend(walker.get_children(&element).unwrap_or_default());
+        elements.push(element);
+    }
+
+    elements
+}
+
+#[cfg(windows)]
+fn diagnostic_text(value: String, max_chars: usize) -> String {
+    let mut text = value
+        .replace('\r', " ")
+        .replace('\n', " ")
+        .replace('|', "/");
+    if text.chars().count() > max_chars {
+        text = text.chars().take(max_chars).collect();
+        text.push('…');
+    }
+    text
+}
+
+#[cfg(windows)]
+fn format_ui_tree_diagnostic(
+    walker: &uiautomation::UITreeWalker,
+    window: &uiautomation::UIElement,
+) -> String {
+    let elements = collect_ui_descendants(walker, window, 1200);
+    let mut lists = 0;
+    let mut list_items = 0;
+    let mut buttons = 0;
+    let mut texts = 0;
+    let mut chat_windows = 0;
+    let mut sample = Vec::new();
+
+    for element in &elements {
+        let control_type = element.get_control_type().ok();
+        match control_type {
+            Some(uiautomation::controls::ControlType::List) => lists += 1,
+            Some(uiautomation::controls::ControlType::ListItem) => list_items += 1,
+            Some(uiautomation::controls::ControlType::Button) => buttons += 1,
+            Some(uiautomation::controls::ControlType::Text) => texts += 1,
+            _ => {}
+        }
+        if element.get_classname().unwrap_or_default() == "ChatWnd" {
+            chat_windows += 1;
+        }
+        if sample.len() < 24 {
+            let class_name = element.get_classname().unwrap_or_default();
+            let name = element.get_name().unwrap_or_default();
+            if !class_name.is_empty() || !name.is_empty() {
+                sample.push(format!(
+                    "{}:{}:{}",
+                    format!(
+                        "{:?}",
+                        control_type.unwrap_or(uiautomation::controls::ControlType::Custom)
+                    ),
+                    diagnostic_text(class_name, 24),
+                    diagnostic_text(name, 32),
+                ));
+            }
+        }
+    }
+
+    format!(
+        "wechat-ui-tree root_class={} root_name={} descendants={} lists={} list_items={} buttons={} texts={} chatwnd={} sample={}",
+        diagnostic_text(window.get_classname().unwrap_or_default(), 40),
+        diagnostic_text(window.get_name().unwrap_or_default(), 40),
+        elements.len(),
+        lists,
+        list_items,
+        buttons,
+        texts,
+        chat_windows,
+        sample.join("|")
     )
 }
 
@@ -672,6 +796,7 @@ mod tests {
             incoming_nodes: 3,
             text_nodes: 0,
             messages: 3,
+            tree_diagnostic: None,
         };
 
         assert_eq!(
@@ -732,6 +857,7 @@ mod tests {
             incoming_nodes: 0,
             text_nodes: 1,
             messages: 0,
+            tree_diagnostic: None,
         }));
         assert!(!should_scan_wechat_fallback(&UiScanSummary {
             windows: 1,
@@ -744,7 +870,16 @@ mod tests {
             incoming_nodes: 2,
             text_nodes: 0,
             messages: 2,
+            tree_diagnostic: None,
         }));
+    }
+
+    #[test]
+    fn emits_tree_diagnostic_only_when_the_snapshot_changes() {
+        assert!(should_emit_tree_diagnostic(None, Some("tree-a")));
+        assert!(!should_emit_tree_diagnostic(Some("tree-a"), Some("tree-a")));
+        assert!(should_emit_tree_diagnostic(Some("tree-a"), Some("tree-b")));
+        assert!(!should_emit_tree_diagnostic(Some("tree-a"), None));
     }
 
     #[test]
