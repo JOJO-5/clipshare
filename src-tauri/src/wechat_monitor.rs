@@ -450,7 +450,7 @@ fn scan_wechat_window(
         let unread_targets = items
             .iter()
             .filter_map(|item| {
-                let session = parse_unread_session_item_from_element(&walker, item)?;
+                let session = parse_unread_session_item_from_element(automation, &walker, item)?;
                 if session_names.insert(session.name.clone()) {
                     Some((item, session))
                 } else {
@@ -519,10 +519,22 @@ fn scan_wechat_window(
 
 #[cfg(windows)]
 fn parse_unread_session_item_from_element(
+    automation: &uiautomation::UIAutomation,
     walker: &uiautomation::UITreeWalker,
     item: &uiautomation::UIElement,
 ) -> Option<WeChatSession> {
     if item.get_control_type().ok()? != uiautomation::controls::ControlType::ListItem {
+        return None;
+    }
+    let has_message_sender = automation
+        .create_matcher()
+        .from_ref(item)
+        .control_type(uiautomation::controls::ControlType::Button)
+        .depth(8)
+        .timeout(0)
+        .find_first()
+        .is_ok();
+    if has_message_sender {
         return None;
     }
     let mut text_names = Vec::new();
