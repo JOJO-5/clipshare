@@ -87,6 +87,25 @@ pub fn extract_latest_message(texts: &[String]) -> Option<WeChatMessage> {
     })
 }
 
+fn select_message_content(
+    item_name: Option<&str>,
+    text_names: &[String],
+    sender: &str,
+) -> Option<String> {
+    text_names
+        .iter()
+        .rev()
+        .map(String::as_str)
+        .map(str::trim)
+        .find(|text| !text.is_empty() && *text != sender)
+        .or_else(|| {
+            item_name
+                .map(str::trim)
+                .filter(|text| !text.is_empty() && *text != sender)
+        })
+        .map(str::to_string)
+}
+
 pub struct WeChatMonitor {
     stop: Arc<AtomicBool>,
 }
@@ -145,12 +164,34 @@ fn scan_wechat(automation: &uiautomation::UIAutomation) -> Vec<WeChatMessage> {
 
 #[cfg(windows)]
 fn find_wechat_windows(automation: &uiautomation::UIAutomation) -> Vec<uiautomation::UIElement> {
+    let direct_chat_windows = automation
+        .create_matcher()
+        .classname("ChatWnd")
+        .depth(1)
+        .timeout(300)
+        .find_all()
+        .unwrap_or_default();
+    if !direct_chat_windows.is_empty() {
+        return direct_chat_windows;
+    }
+
     let mut windows = Vec::new();
     if let (Ok(root), Ok(walker)) = (
         automation.get_root_element(),
         automation.get_control_view_walker(),
     ) {
         if let Some(children) = walker.get_children(&root) {
+            let top_level_chat_windows = children
+                .iter()
+                .filter(|window| window.get_classname().unwrap_or_default() == "ChatWnd")
+                .cloned()
+                .collect::<Vec<_>>();
+            // wxauto locates ChatWnd at the desktop's first child level. It
+            // is a real top-level window in several WeChat versions, so do
+            // not require it to be nested below WeChatMainWndForPC.
+            if !top_level_chat_windows.is_empty() {
+                return top_level_chat_windows;
+            }
             windows.extend(children.into_iter().filter(|window| {
                 let class_name = window.get_classname().unwrap_or_default();
                 let name = window.get_name().unwrap_or_default();
@@ -271,28 +312,24 @@ fn parse_message_item(
         Some((sender, rect.get_left() < item_mid))
     })?;
 
-    let content = item
-        .get_name()
+    let text_names = automation
+        .create_matcher()
+        .from_ref(item)
+        .control_type(uiautomation::controls::ControlType::Text)
+        .depth(8)
+        .timeout(0)
+        .find_all()
         .ok()
-        .filter(|name| !name.trim().is_empty())
-        .or_else(|| {
-            automation
-                .create_matcher()
-                .from_ref(item)
-                .control_type(uiautomation::controls::ControlType::Text)
-                .depth(8)
-                .timeout(0)
-                .find_all()
-                .ok()
-                .and_then(|texts| {
-                    texts
-                        .into_iter()
-                        .filter_map(|text| text.get_name().ok())
-                        .map(|text| text.trim().to_string())
-                        .filter(|text| !text.is_empty() && *text != sender_button.0)
-                        .last()
-                })
-        })?;
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|text| text.get_name().ok())
+        .collect::<Vec<_>>();
+    let item_name = item.get_name().ok();
+    let content = select_message_content(
+        item_name.as_deref(),
+        &text_names,
+        &sender_button.0,
+    )?;
 
     if content.trim().is_empty() || content.trim() == sender_button.0 {
         return None;
@@ -427,5 +464,18 @@ mod tests {
         let pending = tracker.ingest(vec![duplicate.clone(), duplicate]);
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].id, "wechat-ui-duplicate");
+    }
+
+    #[test]
+    fn selects_message_body_before_falling_back_to_item_name() {
+        let texts = vec!["寮犱笁".to_string(), "浣犲ソ".to_string()];
+        assert_eq!(
+            select_message_content(Some("寮犱笁"), &texts, "寮犱笁"),
+            Some("浣犲ソ".to_string())
+        );
+        assert_eq!(
+            select_message_content(Some("浣犲ソ"), &[], "寮犱笁"),
+            Some("浣犲ソ".to_string())
+        );
     }
 }

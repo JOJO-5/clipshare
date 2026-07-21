@@ -75,6 +75,16 @@ jobs:
           cargo install tauri-cli --locked
           npm ci
 
+      - name: Test (Windows)
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        run: |
+          if ('${{ matrix.win7 }}' -eq 'true') {
+            $env:RUSTUP_TOOLCHAIN = 'nightly'
+          }
+          & .\tests\functional-regressions.ps1
+          cargo test --manifest-path src-tauri/Cargo.toml --lib
+
       - name: Build (Win7)
         if: matrix.win7 == true
         shell: pwsh

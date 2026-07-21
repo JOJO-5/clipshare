@@ -4,11 +4,17 @@ use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
+    #[serde(default = "default_role")]
     pub role: String,
+    #[serde(default = "default_port")]
     pub port: u16,
+    #[serde(default)]
     pub target_ip: String,
+    #[serde(default = "default_port")]
     pub target_port: u16,
+    #[serde(default = "default_max_file_size")]
     pub max_file_size: u64,
+    #[serde(default = "default_language")]
     pub language: String,
     #[serde(default = "default_true")]
     pub wechat_enabled: bool,
@@ -22,6 +28,10 @@ pub struct AppConfig {
     pub autostart: bool,
 }
 
+fn default_role() -> String { "server".to_string() }
+fn default_port() -> u16 { 9527 }
+fn default_max_file_size() -> u64 { 104857600 }
+fn default_language() -> String { "zh-CN".to_string() }
 fn default_true() -> bool { true }
 fn default_preview_limit() -> usize { 40 }
 
@@ -101,5 +111,17 @@ mod tests {
 
         assert_eq!(value.get("minimize_to_tray").and_then(|v| v.as_bool()), Some(true));
         assert_eq!(value.get("autostart").and_then(|v| v.as_bool()), Some(false));
+    }
+
+    #[test]
+    fn partial_config_uses_connection_defaults() {
+        let config: AppConfig = serde_json::from_str(
+            r#"{"role":"client","target_ip":"192.168.1.20","target_port":9527}"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.port, 9527);
+        assert_eq!(config.max_file_size, 104857600);
+        assert_eq!(config.language, "zh-CN");
     }
 }

@@ -161,6 +161,11 @@ pub fn send_wechat(message: WeChatMessage, state: State<AppState>) -> Result<(),
 
 #[command]
 pub fn start_wechat_monitor(window: tauri::Window, state: State<AppState>) -> Result<(), String> {
+    let config = AppConfig::load();
+    if !config.wechat_enabled {
+        return Ok(());
+    }
+
     let mut monitor_slot = state.wechat_monitor.lock().unwrap();
     if monitor_slot.is_some() {
         return Ok(());
@@ -169,8 +174,9 @@ pub fn start_wechat_monitor(window: tauri::Window, state: State<AppState>) -> Re
     let logs = Arc::clone(&state.logs);
     let network = Arc::clone(&state.network);
     let window_clone = window.clone();
+    let preview_limit = config.wechat_preview_limit.max(1);
     let monitor = WeChatMonitor::start(move |message| {
-        let message = prepare_wechat_message(message, 40);
+        let message = prepare_wechat_message(message, preview_limit);
         let delivered = network
             .lock()
             .map_err(|_| "Network state is unavailable".to_string())
@@ -286,6 +292,7 @@ fn save_received_file(payload: &[u8]) -> Result<std::path::PathBuf, String> {
     std::fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
     let target = directory.join(filename);
     std::fs::write(&target, contents).map_err(|error| error.to_string())?;
+    crate::clipboard::set_files(&[target.to_string_lossy().into_owned()])?;
     Ok(target)
 }
 

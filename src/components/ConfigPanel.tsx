@@ -39,9 +39,24 @@ export function ConfigPanel() {
 
   const handleSave = async () => {
     try {
-      const values = form.getFieldsValue()
+      // `port` is not mounted while editing client mode, but the Rust command
+      // accepts a complete AppConfig. Include the preserved form store and
+      // fill any missing legacy values before crossing the Tauri IPC boundary.
+      const values = form.getFieldsValue(true)
       await invoke('save_config', {
-        config: { ...values, target_ip: values.target_ip || '', max_file_size: 104857600, language: 'zh-CN' },
+        config: {
+          role: values.role ?? 'server',
+          port: values.port ?? 9527,
+          target_ip: values.target_ip ?? '',
+          target_port: values.target_port ?? 9527,
+          max_file_size: values.max_file_size ?? 104857600,
+          language: 'zh-CN',
+          wechat_enabled: values.wechat_enabled ?? true,
+          wechat_preview_limit: values.wechat_preview_limit ?? 40,
+          wechat_show_content: values.wechat_show_content ?? true,
+          minimize_to_tray: values.minimize_to_tray ?? true,
+          autostart: values.autostart ?? false,
+        },
       })
       message.success('配置已保存')
     } catch (error) {

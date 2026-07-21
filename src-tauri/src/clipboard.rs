@@ -56,6 +56,25 @@ pub fn set_text(text: &str) -> Result<(), String> {
     }
 }
 
+#[cfg(windows)]
+pub fn set_files(paths: &[String]) -> Result<(), String> {
+    use clipboard_win::{formats::FileList, Clipboard, Setter};
+
+    if paths.is_empty() {
+        return Err("Cannot write an empty file list to the clipboard".to_string());
+    }
+
+    let _clipboard = Clipboard::new_attempts(10).map_err(|error| error.to_string())?;
+    FileList
+        .write_clipboard(paths)
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(not(windows))]
+pub fn set_files(_paths: &[String]) -> Result<(), String> {
+    Ok(())
+}
+
 pub fn set_image(width: usize, height: usize, bytes: Vec<u8>) -> Result<(), String> {
     use std::borrow::Cow;
 
