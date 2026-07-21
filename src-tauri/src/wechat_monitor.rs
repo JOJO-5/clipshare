@@ -18,6 +18,9 @@ pub struct UiMessageNode {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct UiScanSummary {
     windows: usize,
+    sessions: usize,
+    unread_sessions: usize,
+    opened_sessions: usize,
     lists: usize,
     items: usize,
     parsed_nodes: usize,
@@ -29,8 +32,11 @@ struct UiScanSummary {
 impl UiScanSummary {
     fn format_log(&self) -> String {
         format!(
-            "wechat-ui windows={} lists={} items={} parsed={} incoming={} text_nodes={} messages={}",
+            "wechat-ui windows={} sessions={} unread_sessions={} opened_sessions={} lists={} items={} parsed={} incoming={} text_nodes={} messages={}",
             self.windows,
+            self.sessions,
+            self.unread_sessions,
+            self.opened_sessions,
             self.lists,
             self.items,
             self.parsed_nodes,
@@ -41,8 +47,89 @@ impl UiScanSummary {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WeChatSession {
+    name: String,
+    unread_count: usize,
+}
+
+fn parse_unread_session_label(label: &str) -> Option<WeChatSession> {
+    let marker = "条新消息";
+    let marker_start = label.find(marker)?;
+    let digits = label[..marker_start]
+        .chars()
+        .rev()
+        .take_while(|character| character.is_ascii_digit())
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    let unread_count = digits.parse::<usize>().ok()?;
+    if unread_count == 0 {
+        return None;
+    }
+
+    let name_end = marker_start.saturating_sub(digits.len());
+    let name = label[..name_end]
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .last()
+        .unwrap_or_default();
+    if name.is_empty() {
+        return None;
+    }
+
+    Some(WeChatSession {
+        name: name.to_string(),
+        unread_count,
+    })
+}
+
+fn parse_unread_session_item(label: Option<&str>, text_names: &[String]) -> Option<WeChatSession> {
+    let candidates = label
+        .into_iter()
+        .chain(text_names.iter().map(String::as_str))
+        .collect::<Vec<_>>();
+    if let Some(session) = candidates
+        .iter()
+        .find_map(|candidate| parse_unread_session_label(candidate))
+    {
+        return Some(session);
+    }
+
+    let unread_count = candidates.iter().find_map(|candidate| {
+        let marker_start = candidate.find("条新消息")?;
+        let digits = candidate[..marker_start]
+            .chars()
+            .rev()
+            .take_while(|character| character.is_ascii_digit())
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect::<String>();
+        digits.parse::<usize>().ok()
+    })?;
+    if unread_count == 0 {
+        return None;
+    }
+    let name = candidates
+        .iter()
+        .map(|candidate| candidate.trim())
+        .find(|candidate| !candidate.is_empty() && !candidate.contains("条新消息"))?;
+    Some(WeChatSession {
+        name: name.to_string(),
+        unread_count,
+    })
+}
+
+fn select_latest_messages<T>(items: &[T], count: usize) -> &[T] {
+    let start = items.len().saturating_sub(count);
+    &items[start..]
+}
+
 fn should_scan_wechat_fallback(summary: &UiScanSummary) -> bool {
-    summary.lists == 0 && summary.items == 0 && summary.messages == 0
+    summary.parsed_nodes == 0 && summary.messages == 0 && summary.unread_sessions == 0
 }
 
 pub fn messages_from_nodes(nodes: &[UiMessageNode]) -> Vec<WeChatMessage> {
@@ -209,38 +296,40 @@ impl Drop for WeChatMonitor {
 }
 
 #[cfg(windows)]
-fn scan_wechat(
-    automation: &uiautomation::UIAutomation,
-) -> (Vec<WeChatMessage>, UiScanSummary) {
-    let windows = find_wechat_windows(automation);
+fn scan_wechat(automation: &uiautomation::UIAutomation) -> (Vec<WeChatMessage>, UiScanSummary) {
+    let main_windows = find_wechat_main_windows(automation);
     let mut summary = UiScanSummary {
-        windows: windows.len(),
+        windows: main_windows.len(),
         ..UiScanSummary::default()
     };
     let mut messages = Vec::new();
-    for window in windows {
+    for window in main_windows {
         let (window_messages, window_summary) = scan_wechat_window(automation, &window);
-        summary.lists += window_summary.lists;
-        summary.items += window_summary.items;
-        summary.parsed_nodes += window_summary.parsed_nodes;
-        summary.incoming_nodes += window_summary.incoming_nodes;
-        summary.text_nodes += window_summary.text_nodes;
+        merge_scan_summary(&mut summary, &window_summary);
         messages.extend(window_messages);
     }
     if should_scan_wechat_fallback(&summary) {
-        for window in find_wechat_main_windows(automation) {
+        for window in find_wechat_windows(automation) {
             let (window_messages, window_summary) = scan_wechat_window(automation, &window);
             summary.windows += 1;
-            summary.lists += window_summary.lists;
-            summary.items += window_summary.items;
-            summary.parsed_nodes += window_summary.parsed_nodes;
-            summary.incoming_nodes += window_summary.incoming_nodes;
-            summary.text_nodes += window_summary.text_nodes;
+            merge_scan_summary(&mut summary, &window_summary);
             messages.extend(window_messages);
         }
     }
     summary.messages = messages.len();
     (messages, summary)
+}
+
+#[cfg(windows)]
+fn merge_scan_summary(target: &mut UiScanSummary, source: &UiScanSummary) {
+    target.sessions += source.sessions;
+    target.unread_sessions += source.unread_sessions;
+    target.opened_sessions += source.opened_sessions;
+    target.lists += source.lists;
+    target.items += source.items;
+    target.parsed_nodes += source.parsed_nodes;
+    target.incoming_nodes += source.incoming_nodes;
+    target.text_nodes += source.text_nodes;
 }
 
 #[cfg(windows)]
@@ -353,22 +442,58 @@ fn scan_wechat_window(
         .unwrap_or_default();
 
     if !lists.is_empty() {
-        let list_count = lists.len();
         let items = lists
-            .into_iter()
-            .flat_map(|list| walker.get_children(&list).unwrap_or_default())
+            .iter()
+            .flat_map(|list| walker.get_children(list).unwrap_or_default())
             .collect::<Vec<_>>();
-        let item_count = items.len();
-        let nodes = items
-            .into_iter()
-            .filter_map(|item| parse_message_item(automation, &item))
+        let mut session_names = HashSet::new();
+        let unread_targets = items
+            .iter()
+            .filter_map(|item| {
+                let session = parse_unread_session_item_from_element(&walker, item)?;
+                if session_names.insert(session.name.clone()) {
+                    Some((item, session))
+                } else {
+                    None
+                }
+            })
             .collect::<Vec<_>>();
-        let messages = messages_from_nodes(&nodes);
+        let unread_sessions = unread_targets.len();
+        let nodes = parse_message_nodes(automation, &items);
+        let mut messages = messages_from_nodes(&nodes);
+        let mut opened_sessions = 0;
+
+        for (item, session) in unread_targets {
+            if item.click().is_err() {
+                continue;
+            }
+            opened_sessions += 1;
+            thread::sleep(Duration::from_millis(120));
+            let current_lists = automation
+                .create_matcher()
+                .from_ref(window)
+                .control_type(uiautomation::controls::ControlType::List)
+                .depth(12)
+                .timeout(100)
+                .find_all()
+                .unwrap_or_default();
+            let current_items = current_lists
+                .iter()
+                .flat_map(|list| walker.get_children(list).unwrap_or_default())
+                .collect::<Vec<_>>();
+            let current_nodes = parse_message_nodes(automation, &current_items);
+            let latest_nodes = select_latest_messages(&current_nodes, session.unread_count);
+            messages.extend(messages_from_nodes(latest_nodes));
+        }
+
         return (
             messages.clone(),
             UiScanSummary {
-                lists: list_count,
-                items: item_count,
+                sessions: unread_sessions,
+                unread_sessions,
+                opened_sessions,
+                lists: lists.len(),
+                items: items.len(),
                 parsed_nodes: nodes.len(),
                 incoming_nodes: nodes.iter().filter(|node| node.incoming).count(),
                 messages: messages.len(),
@@ -379,7 +504,9 @@ fn scan_wechat_window(
 
     let mut texts = Vec::new();
     collect_ui_text(&walker, window, &mut texts);
-    let messages = extract_latest_message(&texts).into_iter().collect::<Vec<_>>();
+    let messages = extract_latest_message(&texts)
+        .into_iter()
+        .collect::<Vec<_>>();
     (
         messages.clone(),
         UiScanSummary {
@@ -388,6 +515,30 @@ fn scan_wechat_window(
             ..UiScanSummary::default()
         },
     )
+}
+
+#[cfg(windows)]
+fn parse_unread_session_item_from_element(
+    walker: &uiautomation::UITreeWalker,
+    item: &uiautomation::UIElement,
+) -> Option<WeChatSession> {
+    if item.get_control_type().ok()? != uiautomation::controls::ControlType::ListItem {
+        return None;
+    }
+    let mut text_names = Vec::new();
+    collect_ui_text(walker, item, &mut text_names);
+    parse_unread_session_item(item.get_name().ok().as_deref(), &text_names)
+}
+
+#[cfg(windows)]
+fn parse_message_nodes(
+    automation: &uiautomation::UIAutomation,
+    items: &[uiautomation::UIElement],
+) -> Vec<UiMessageNode> {
+    items
+        .iter()
+        .filter_map(|item| parse_message_item(automation, item))
+        .collect()
 }
 
 #[cfg(windows)]
@@ -442,11 +593,7 @@ fn parse_message_item(
         .filter_map(|text| text.get_name().ok())
         .collect::<Vec<_>>();
     let item_name = item.get_name().ok();
-    let content = select_message_content(
-        item_name.as_deref(),
-        &text_names,
-        &sender_button.0,
-    )?;
+    let content = select_message_content(item_name.as_deref(), &text_names, &sender_button.0)?;
 
     if content.trim().is_empty() || content.trim() == sender_button.0 {
         return None;
@@ -504,6 +651,9 @@ mod tests {
     fn formats_ui_scan_summary_with_message_counts() {
         let summary = UiScanSummary {
             windows: 1,
+            sessions: 4,
+            unread_sessions: 2,
+            opened_sessions: 1,
             lists: 2,
             items: 8,
             parsed_nodes: 6,
@@ -514,14 +664,56 @@ mod tests {
 
         assert_eq!(
             summary.format_log(),
-            "wechat-ui windows=1 lists=2 items=8 parsed=6 incoming=3 text_nodes=0 messages=3"
+            "wechat-ui windows=1 sessions=4 unread_sessions=2 opened_sessions=1 lists=2 items=8 parsed=6 incoming=3 text_nodes=0 messages=3"
         );
+    }
+
+    #[test]
+    fn parses_wxauto_style_unread_session_labels() {
+        assert_eq!(
+            parse_unread_session_label("张三\n3条新消息"),
+            Some(WeChatSession {
+                name: "张三".to_string(),
+                unread_count: 3,
+            })
+        );
+        assert_eq!(
+            parse_unread_session_label("工作群 12条新消息"),
+            Some(WeChatSession {
+                name: "工作群".to_string(),
+                unread_count: 12,
+            })
+        );
+        assert!(parse_unread_session_label("张三\n没有新消息").is_none());
+    }
+
+    #[test]
+    fn parses_unread_count_from_text_child_when_item_name_is_empty() {
+        let texts = vec!["李四".to_string(), "2条新消息".to_string()];
+        assert_eq!(
+            parse_unread_session_item(None, &texts),
+            Some(WeChatSession {
+                name: "李四".to_string(),
+                unread_count: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn selects_only_the_latest_unread_message_items() {
+        let items = ["old", "middle", "new"];
+        assert_eq!(select_latest_messages(&items, 2), &["middle", "new"]);
+        assert_eq!(select_latest_messages(&items, 10), &items);
+        assert!(select_latest_messages(&items, 0).is_empty());
     }
 
     #[test]
     fn requests_main_window_fallback_when_chat_shell_has_no_message_controls() {
         assert!(should_scan_wechat_fallback(&UiScanSummary {
             windows: 1,
+            sessions: 0,
+            unread_sessions: 0,
+            opened_sessions: 0,
             lists: 0,
             items: 0,
             parsed_nodes: 0,
@@ -531,6 +723,9 @@ mod tests {
         }));
         assert!(!should_scan_wechat_fallback(&UiScanSummary {
             windows: 1,
+            sessions: 0,
+            unread_sessions: 0,
+            opened_sessions: 0,
             lists: 1,
             items: 4,
             parsed_nodes: 4,
