@@ -8,6 +8,8 @@ use crate::config::AppConfig;
 use crate::protocol::*;
 use crate::wechat_monitor::WeChatMonitor;
 use crate::autostart::set_autostart;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 pub struct AppState {
     pub network: Arc<Mutex<NetworkManager>>,
@@ -37,6 +39,9 @@ pub fn save_config(config: AppConfig) -> Result<(), String> {
     set_autostart(config.autostart)?;
     config.save()
 }
+
+const MAX_RECEIVED_FILES: usize = 100;
+const RECEIVED_FILE_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 #[command]
 pub fn get_connection_status(state: State<AppState>) -> String {
@@ -293,12 +298,68 @@ fn save_received_file(payload: &[u8]) -> Result<std::path::PathBuf, String> {
     let target = directory.join(filename);
     std::fs::write(&target, contents).map_err(|error| error.to_string())?;
     crate::clipboard::set_files(&[target.to_string_lossy().into_owned()])?;
+    cleanup_received_files(&directory, &target);
     Ok(target)
+}
+
+fn select_received_files_for_cleanup(
+    mut files: Vec<(PathBuf, SystemTime)>,
+    current_file: &Path,
+    now: SystemTime,
+) -> Vec<PathBuf> {
+    files.sort_by_key(|(_, modified)| *modified);
+    let keep_current = files.iter().any(|(path, _)| path == current_file);
+    let max_other_files = MAX_RECEIVED_FILES.saturating_sub(usize::from(keep_current));
+    let cutoff = now
+        .checked_sub(RECEIVED_FILE_RETENTION)
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    let mut removals = Vec::new();
+    let mut fresh_files = Vec::new();
+
+    for (path, modified) in files {
+        if path == current_file {
+            continue;
+        }
+        if modified < cutoff {
+            removals.push(path);
+        } else {
+            fresh_files.push(path);
+        }
+    }
+
+    if fresh_files.len() > max_other_files {
+        let excess = fresh_files.len() - max_other_files;
+        removals.extend(fresh_files.into_iter().take(excess));
+    }
+
+    removals
+}
+
+fn cleanup_received_files(directory: &Path, current_file: &Path) {
+    let files = match std::fs::read_dir(directory) {
+        Ok(entries) => entries
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let file_type = entry.file_type().ok()?;
+                if !file_type.is_file() {
+                    return None;
+                }
+                let modified = entry.metadata().ok()?.modified().ok()?;
+                Some((entry.path(), modified))
+            })
+            .collect(),
+        Err(_) => return,
+    };
+
+    for path in select_received_files_for_cleanup(files, current_file, SystemTime::now()) {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, SystemTime};
 
     #[test]
     fn clipboard_content_is_not_marked_delivered_when_peer_is_disconnected() {
@@ -309,5 +370,43 @@ mod tests {
             crate::clipboard::ClipboardContent::Text("pending transfer".to_string()),
         )
         .is_err());
+    }
+
+    #[test]
+    fn received_file_cleanup_removes_expired_files_but_keeps_current_file() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
+        let current = std::path::PathBuf::from("current.txt");
+        let expired = std::path::PathBuf::from("expired.txt");
+        let fresh = std::path::PathBuf::from("fresh.txt");
+
+        let removals = select_received_files_for_cleanup(
+            vec![
+                (current.clone(), now - Duration::from_secs(8 * 24 * 60 * 60)),
+                (expired.clone(), now - Duration::from_secs(8 * 24 * 60 * 60)),
+                (fresh, now - Duration::from_secs(60)),
+            ],
+            &current,
+            now,
+        );
+
+        assert_eq!(removals, vec![expired]);
+    }
+
+    #[test]
+    fn received_file_cleanup_caps_fresh_cache_at_one_hundred_files() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
+        let current = std::path::PathBuf::from("file-100.txt");
+        let files = (0..=100)
+            .map(|index| {
+                (
+                    std::path::PathBuf::from(format!("file-{index}.txt")),
+                    now - Duration::from_secs(1_000 - index as u64),
+                )
+            })
+            .collect();
+
+        let removals = select_received_files_for_cleanup(files, &current, now);
+
+        assert_eq!(removals, vec![std::path::PathBuf::from("file-0.txt")]);
     }
 }
