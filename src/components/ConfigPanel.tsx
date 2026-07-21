@@ -12,6 +12,8 @@ interface Config {
   wechat_enabled: boolean
   wechat_preview_limit: number
   wechat_show_content: boolean
+  minimize_to_tray: boolean
+  autostart: boolean
 }
 
 export function ConfigPanel() {
@@ -75,7 +77,7 @@ export function ConfigPanel() {
     <div className="config-panel">
       <div className="config-scroll">
         <div className="section-kicker">连接设置</div>
-        <Form form={form} layout="vertical" initialValues={{ role: 'server', port: 9527, target_port: 9527, max_file_size: 104857600, wechat_enabled: true, wechat_preview_limit: 40, wechat_show_content: true }}>
+        <Form form={form} layout="vertical" initialValues={{ role: 'server', port: 9527, target_port: 9527, max_file_size: 104857600, wechat_enabled: true, wechat_preview_limit: 40, wechat_show_content: true, minimize_to_tray: true, autostart: false }}>
           <Form.Item name="role" label="运行模式">
             <Radio.Group className="role-switch">
               <Radio.Button value="server">接收端</Radio.Button>
@@ -111,6 +113,12 @@ export function ConfigPanel() {
             <InputNumber min={1} max={200} addonAfter="字" className="form-control" />
           </Form.Item>
           <Form.Item name="wechat_show_content" label="点击后显示完整正文" valuePropName="checked">
+            <Switch />
+          </Form.Item>
+          <Form.Item name="minimize_to_tray" label="关闭或最小化时隐藏到托盘" valuePropName="checked">
+            <Switch />
+          </Form.Item>
+          <Form.Item name="autostart" label="开机自启（启动后最小化）" valuePropName="checked">
             <Switch />
           </Form.Item>
         </Form>

@@ -82,7 +82,7 @@ jobs:
           $env:RUSTUP_TOOLCHAIN = 'nightly'
           npm run build
           $env:TAURI_CONFIG = Get-Content -Raw src-tauri/tauri.win7.conf.json
-          cargo build --manifest-path src-tauri/Cargo.toml --release --target ${{ matrix.target }} --bin clipshare --locked
+          cargo build --manifest-path src-tauri/Cargo.toml --release --target ${{ matrix.target }} --bin clipshare --features win7-compat --locked
 
       - name: Build (Windows)
         if: matrix.platform == 'windows-latest' && matrix.win7 == false

@@ -41,17 +41,26 @@ function App() {
     const appendLog = (entry: LogEntry) => setLogs(prev => [...prev.slice(-499), entry])
 
     const subscribeToLogs = async () => {
-      let permissionGranted = await isPermissionGranted()
-      if (!permissionGranted) permissionGranted = (await requestPermission()) === 'granted'
+      let permissionGranted = false
+      try {
+        permissionGranted = await isPermissionGranted()
+        if (!permissionGranted) permissionGranted = (await requestPermission()) === 'granted'
+      } catch {
+        permissionGranted = false
+      }
 
-      const notificationActionListener = await onAction(action => {
-        const messageId = action.extra?.messageId
-        if (typeof messageId === 'string') {
-          const message = wechatMessages.current.get(messageId)
-          if (message) setSelectedWeChat(message)
-        }
-      })
-      stopNotificationAction = () => { void notificationActionListener.unregister() }
+      try {
+        const notificationActionListener = await onAction(action => {
+          const messageId = action.extra?.messageId
+          if (typeof messageId === 'string') {
+            const message = wechatMessages.current.get(messageId)
+            if (message) setSelectedWeChat(message)
+          }
+        })
+        stopNotificationAction = () => { void notificationActionListener.unregister() }
+      } catch {
+        stopNotificationAction = undefined
+      }
 
       const [changed, received, wechat] = await Promise.all([
         listen<LogEntry>('clipboard-changed', event => appendLog(event.payload)),

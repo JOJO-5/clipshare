@@ -1,5 +1,13 @@
 # ClipShare
 
+## Tray and startup
+
+- The configuration page can hide the window to the tray when it is closed or minimized.
+- The tray menu restores the main window or exits ClipShare.
+- “Autostart” uses the current user's Windows Run entry and launches with `--minimized`.
+- The Win7 flavor pins `uiautomation = 0.23.0` so the executable does not import the missing `combase.dll`.
+- The Win7 flavor also uses the `win7-compat` Cargo feature, which leaves the modern WinRT notification plugin out of that binary; Win10/11 remains the notification display endpoint.
+
 ClipShare 是一个面向局域网的剪贴板共享工具，使用 Tauri、React、TypeScript 和 Rust 构建。连接后，设备之间可以实时同步文本、图片和文件。
 
 ## 功能

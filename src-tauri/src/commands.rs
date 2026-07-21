@@ -7,6 +7,7 @@ use crate::network::NetworkManager;
 use crate::config::AppConfig;
 use crate::protocol::*;
 use crate::wechat_monitor::WeChatMonitor;
+use crate::autostart::set_autostart;
 
 pub struct AppState {
     pub network: Arc<Mutex<NetworkManager>>,
@@ -33,6 +34,7 @@ pub fn get_config() -> AppConfig {
 
 #[command]
 pub fn save_config(config: AppConfig) -> Result<(), String> {
+    set_autostart(config.autostart)?;
     config.save()
 }
 

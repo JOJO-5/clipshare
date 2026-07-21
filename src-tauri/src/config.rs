@@ -16,6 +16,10 @@ pub struct AppConfig {
     pub wechat_preview_limit: usize,
     #[serde(default)]
     pub wechat_show_content: bool,
+    #[serde(default = "default_true")]
+    pub minimize_to_tray: bool,
+    #[serde(default)]
+    pub autostart: bool,
 }
 
 fn default_true() -> bool { true }
@@ -33,6 +37,8 @@ impl Default for AppConfig {
             wechat_enabled: true,
             wechat_preview_limit: 40,
             wechat_show_content: true,
+            minimize_to_tray: true,
+            autostart: false,
         }
     }
 }
@@ -85,5 +91,15 @@ mod tests {
         assert!(config.wechat_enabled);
         assert_eq!(config.wechat_preview_limit, 40);
         assert!(!config.wechat_show_content);
+        assert!(config.minimize_to_tray);
+        assert!(!config.autostart);
+    }
+
+    #[test]
+    fn default_config_persists_tray_and_autostart_preferences() {
+        let value = serde_json::to_value(AppConfig::default()).unwrap();
+
+        assert_eq!(value.get("minimize_to_tray").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(value.get("autostart").and_then(|v| v.as_bool()), Some(false));
     }
 }
