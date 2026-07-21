@@ -41,6 +41,10 @@ impl UiScanSummary {
     }
 }
 
+fn should_scan_wechat_fallback(summary: &UiScanSummary) -> bool {
+    summary.lists == 0 && summary.items == 0 && summary.messages == 0
+}
+
 pub fn messages_from_nodes(nodes: &[UiMessageNode]) -> Vec<WeChatMessage> {
     nodes
         .iter()
@@ -223,8 +227,32 @@ fn scan_wechat(
         summary.text_nodes += window_summary.text_nodes;
         messages.extend(window_messages);
     }
+    if should_scan_wechat_fallback(&summary) {
+        for window in find_wechat_main_windows(automation) {
+            let (window_messages, window_summary) = scan_wechat_window(automation, &window);
+            summary.windows += 1;
+            summary.lists += window_summary.lists;
+            summary.items += window_summary.items;
+            summary.parsed_nodes += window_summary.parsed_nodes;
+            summary.incoming_nodes += window_summary.incoming_nodes;
+            summary.text_nodes += window_summary.text_nodes;
+            messages.extend(window_messages);
+        }
+    }
     summary.messages = messages.len();
     (messages, summary)
+}
+
+#[cfg(windows)]
+fn find_wechat_main_windows(
+    automation: &uiautomation::UIAutomation,
+) -> Vec<uiautomation::UIElement> {
+    automation
+        .create_matcher()
+        .classname("WeChatMainWndForPC")
+        .timeout(300)
+        .find_all()
+        .unwrap_or_default()
 }
 
 #[cfg(windows)]
@@ -488,6 +516,28 @@ mod tests {
             summary.format_log(),
             "wechat-ui windows=1 lists=2 items=8 parsed=6 incoming=3 text_nodes=0 messages=3"
         );
+    }
+
+    #[test]
+    fn requests_main_window_fallback_when_chat_shell_has_no_message_controls() {
+        assert!(should_scan_wechat_fallback(&UiScanSummary {
+            windows: 1,
+            lists: 0,
+            items: 0,
+            parsed_nodes: 0,
+            incoming_nodes: 0,
+            text_nodes: 1,
+            messages: 0,
+        }));
+        assert!(!should_scan_wechat_fallback(&UiScanSummary {
+            windows: 1,
+            lists: 1,
+            items: 4,
+            parsed_nodes: 4,
+            incoming_nodes: 2,
+            text_nodes: 0,
+            messages: 2,
+        }));
     }
 
     #[test]
