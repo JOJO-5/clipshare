@@ -79,6 +79,7 @@ jobs:
         if: matrix.platform == 'windows-latest'
         shell: pwsh
         run: |
+          npm run build
           if ('${{ matrix.win7 }}' -eq 'true') {
             $env:RUSTUP_TOOLCHAIN = 'nightly'
           }
