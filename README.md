@@ -9,7 +9,7 @@
 - The Win7 flavor also uses the `win7-compat` Cargo feature, which leaves the modern WinRT notification plugin out of that binary; Win10/11 remains the notification display endpoint.
 - The Win7 installer bundles the fixed WebView2 109 runtime because newer WebView2 bootstrapper versions call APIs that do not exist on Windows 7.
 - Client connections remain in `Connecting` and retry with backoff until the receiver is available. After a TCP disconnect, the client reconnects automatically and the server continues accepting a replacement client.
-- The log panel records `clipboard-read` and `clipboard-send` diagnostics, including failed sends and retry attempts.
+- The log panel records `clipboard-read`, `clipboard-send`, and periodic `clipboard-monitor alive` diagnostics, including failed sends and retry attempts.
 
 ClipShare 是一个面向局域网的剪贴板共享工具，使用 Tauri、React、TypeScript 和 Rust 构建。连接后，设备之间可以实时同步文本、图片和文件。
 

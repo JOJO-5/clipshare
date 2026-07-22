@@ -20,6 +20,10 @@ fn should_retry_observation(
     current != delivered && (current != attempted || retry_elapsed)
 }
 
+fn should_emit_health_log(elapsed: Duration) -> bool {
+    elapsed >= Duration::from_secs(30)
+}
+
 impl ClipboardContent {
     pub fn data_type(&self) -> &'static str {
         match self {
@@ -32,8 +36,8 @@ impl ClipboardContent {
     pub fn summary(&self) -> String {
         match self {
             ClipboardContent::Text(t) => {
-                if t.len() > 20 {
-                    format!("{}...", &t[..20])
+                if t.chars().count() > 20 {
+                    format!("{}...", t.chars().take(20).collect::<String>())
                 } else {
                     t.clone()
                 }
@@ -142,11 +146,16 @@ impl ClipboardListener {
             let mut last_image: Vec<u8> = Vec::new();
             let mut attempted_image: Vec<u8> = Vec::new();
             let mut last_image_attempt = Instant::now() - RETRY_INTERVAL;
+            let mut last_health_log = Instant::now();
 
             on_diagnostic("clipboard-monitor started interval=300ms retry=2s".to_string());
 
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(300));
+                if should_emit_health_log(last_health_log.elapsed()) {
+                    on_diagnostic("clipboard-monitor alive".to_string());
+                    last_health_log = Instant::now();
+                }
 
                 if let Ok(text) = get_clipboard::<String, _>(Unicode) {
                     if !text.is_empty()
@@ -271,5 +280,19 @@ mod tests {
         assert!(!should_retry_observation("new", "old", "new", false));
         assert!(should_retry_observation("new", "old", "new", true));
         assert!(!should_retry_observation("new", "new", "new", true));
+    }
+
+    #[test]
+    fn unicode_text_summary_never_slices_inside_a_character() {
+        let text = "\u{4e2d}".repeat(21);
+        let summary = ClipboardContent::Text(text).summary();
+
+        assert_eq!(summary, format!("{}...", "\u{4e2d}".repeat(20)));
+    }
+
+    #[test]
+    fn clipboard_health_log_is_rate_limited() {
+        assert!(!should_emit_health_log(Duration::from_secs(29)));
+        assert!(should_emit_health_log(Duration::from_secs(30)));
     }
 }
