@@ -92,10 +92,10 @@ fn parse_unread_session_item(label: Option<&str>, text_names: &[String]) -> Opti
         .into_iter()
         .chain(text_names.iter().map(String::as_str))
         .collect::<Vec<_>>();
-    if let Some(session) = candidates
-        .iter()
-        .find_map(|candidate| parse_unread_session_label(candidate))
-    {
+    if let Some(session) = candidates.iter().find_map(|candidate| {
+        parse_unread_session_label(candidate)
+            .or_else(|| parse_wechat4_unread_session_label(candidate))
+    }) {
         return Some(session);
     }
 
@@ -124,6 +124,58 @@ fn parse_unread_session_item(label: Option<&str>, text_names: &[String]) -> Opti
     })
 }
 
+fn parse_wechat4_unread_session_label(label: &str) -> Option<WeChatSession> {
+    let unread_count = label.lines().find_map(|line| {
+        let marker_end = line.find("\u{6761}]")?;
+        let marker_start = line[..marker_end].rfind('[')?;
+        line[marker_start + 1..marker_end].parse::<usize>().ok()
+    })?;
+    if unread_count == 0 {
+        return None;
+    }
+
+    let name = label
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !(line.contains('[') && line.contains("\u{6761}]")))?;
+    Some(WeChatSession {
+        name: name.to_string(),
+        unread_count,
+    })
+}
+
+fn parse_wechat4_message_snapshot(
+    class_name: &str,
+    name: &str,
+    runtime_id: &str,
+    sender: &str,
+) -> Option<UiMessageNode> {
+    if !is_wechat4_message_class(class_name)
+        || name.trim().is_empty()
+        || runtime_id.is_empty()
+        || sender.trim().is_empty()
+    {
+        return None;
+    }
+
+    Some(UiMessageNode {
+        runtime_id: runtime_id.to_string(),
+        sender: sender.trim().to_string(),
+        content: name.trim().to_string(),
+        incoming: true,
+    })
+}
+
+fn is_wechat4_message_class(class_name: &str) -> bool {
+    matches!(
+        class_name,
+        "mmui::ChatTextItemView"
+            | "mmui::ChatBubbleItemView"
+            | "mmui::ChatVoiceItemView"
+            | "mmui::ChatPersonalCardItemView"
+    )
+}
+
 fn select_latest_messages<T>(items: &[T], count: usize) -> &[T] {
     let start = items.len().saturating_sub(count);
     &items[start..]
@@ -139,6 +191,14 @@ fn should_emit_tree_diagnostic(previous: Option<&str>, current: Option<&str>) ->
 
 fn should_prefer_raw_view(control_descendants: usize, raw_descendants: usize) -> bool {
     control_descendants == 0 && raw_descendants > 0
+}
+
+fn should_use_handle_rebound(
+    current_descendants: usize,
+    rebound_descendants: usize,
+    rebound_is_mmui: bool,
+) -> bool {
+    rebound_descendants > current_descendants || (current_descendants == 0 && rebound_is_mmui)
 }
 
 pub fn messages_from_nodes(nodes: &[UiMessageNode]) -> Vec<WeChatMessage> {
@@ -455,6 +515,44 @@ fn scan_wechat_window(
         Err(_) => return (Vec::new(), UiScanSummary::default()),
     };
     let raw_walker = automation.get_raw_view_walker().ok();
+    let original_control_descendants = collect_ui_descendants(&control_walker, window, 1200).len();
+    let original_raw_descendants = raw_walker
+        .as_ref()
+        .map(|walker| collect_ui_descendants(walker, window, 1200).len())
+        .unwrap_or(0);
+    let original_descendants = original_control_descendants.max(original_raw_descendants);
+    let mut scan_window = window.clone();
+    let mut rebound_attempted = false;
+    let mut rebound_used = false;
+    let mut rebound_descendants = 0;
+
+    if let Ok(handle) = window.get_native_window_handle() {
+        if !handle.is_invalid() {
+            rebound_attempted = true;
+            if let Ok(rebound) = automation.element_from_handle(handle) {
+                let rebound_control_descendants =
+                    collect_ui_descendants(&control_walker, &rebound, 1200).len();
+                let rebound_raw_descendants = raw_walker
+                    .as_ref()
+                    .map(|walker| collect_ui_descendants(walker, &rebound, 1200).len())
+                    .unwrap_or(0);
+                rebound_descendants = rebound_control_descendants.max(rebound_raw_descendants);
+                let rebound_is_mmui = rebound
+                    .get_classname()
+                    .map(|class_name| class_name.starts_with("mmui::"))
+                    .unwrap_or(false);
+                if should_use_handle_rebound(
+                    original_descendants,
+                    rebound_descendants,
+                    rebound_is_mmui,
+                ) {
+                    scan_window = rebound;
+                    rebound_used = true;
+                }
+            }
+        }
+    }
+    let window = &scan_window;
     let control_descendants = collect_ui_descendants(&control_walker, window, 1200).len();
     let raw_descendants = raw_walker
         .as_ref()
@@ -502,7 +600,13 @@ fn scan_wechat_window(
                 .iter()
                 .flat_map(|list| tree_walker.get_children(list).unwrap_or_default())
                 .collect::<Vec<_>>();
-            let current_nodes = parse_message_nodes(automation, &current_items);
+            let classic_nodes = parse_message_nodes(automation, &current_items);
+            let wechat4_nodes = parse_wechat4_message_nodes(&current_items, &session.name);
+            let current_nodes = if wechat4_nodes.is_empty() {
+                classic_nodes
+            } else {
+                wechat4_nodes
+            };
             let latest_nodes = select_latest_messages(&current_nodes, session.unread_count);
             messages.extend(messages_from_nodes(latest_nodes));
         }
@@ -519,7 +623,14 @@ fn scan_wechat_window(
                 incoming_nodes: nodes.iter().filter(|node| node.incoming).count(),
                 messages: messages.len(),
                 tree_diagnostic: (nodes.is_empty() && unread_sessions == 0).then(|| {
-                    format_ui_tree_diagnostic(&control_walker, raw_walker.as_ref(), window)
+                    format_ui_tree_diagnostic(
+                        &control_walker,
+                        raw_walker.as_ref(),
+                        window,
+                        rebound_attempted,
+                        rebound_used,
+                        rebound_descendants,
+                    )
                 }),
                 ..UiScanSummary::default()
             },
@@ -540,6 +651,9 @@ fn scan_wechat_window(
                 &control_walker,
                 raw_walker.as_ref(),
                 window,
+                rebound_attempted,
+                rebound_used,
+                rebound_descendants,
             )),
             ..UiScanSummary::default()
         },
@@ -613,6 +727,9 @@ fn format_ui_tree_diagnostic(
     control_walker: &uiautomation::UITreeWalker,
     raw_walker: Option<&uiautomation::UITreeWalker>,
     window: &uiautomation::UIElement,
+    rebound_attempted: bool,
+    rebound_used: bool,
+    rebound_descendants: usize,
 ) -> String {
     let control_elements = collect_ui_descendants(control_walker, window, 1200);
     let raw_elements = raw_walker
@@ -628,6 +745,8 @@ fn format_ui_tree_diagnostic(
     let mut buttons = 0;
     let mut texts = 0;
     let mut chat_windows = 0;
+    let mut mmui_elements = 0;
+    let mut wechat4_message_items = 0;
     let mut sample = Vec::new();
 
     for element in elements.iter() {
@@ -639,11 +758,17 @@ fn format_ui_tree_diagnostic(
             Some(uiautomation::controls::ControlType::Text) => texts += 1,
             _ => {}
         }
-        if element.get_classname().unwrap_or_default() == "ChatWnd" {
+        let class_name = element.get_classname().unwrap_or_default();
+        if class_name == "ChatWnd" {
             chat_windows += 1;
         }
+        if class_name.starts_with("mmui::") {
+            mmui_elements += 1;
+        }
+        if is_wechat4_message_class(&class_name) {
+            wechat4_message_items += 1;
+        }
         if sample.len() < 24 {
-            let class_name = element.get_classname().unwrap_or_default();
             let name = element.get_name().unwrap_or_default();
             if !class_name.is_empty() || !name.is_empty() {
                 sample.push(format!(
@@ -660,17 +785,22 @@ fn format_ui_tree_diagnostic(
     }
 
     format!(
-        "wechat-ui-tree root_class={} root_name={} control_descendants={} raw_descendants={} descendants={} lists={} list_items={} buttons={} texts={} chatwnd={} sample={}",
+        "wechat-ui-tree root_class={} root_name={} control_descendants={} raw_descendants={} descendants={} handle_rebound_attempted={} handle_rebound_used={} rebound_descendants={} lists={} list_items={} buttons={} texts={} chatwnd={} mmui={} wechat4_items={} sample={}",
         diagnostic_text(window.get_classname().unwrap_or_default(), 40),
         diagnostic_text(window.get_name().unwrap_or_default(), 40),
         control_elements.len(),
         raw_elements.len(),
         elements.len(),
+        usize::from(rebound_attempted),
+        usize::from(rebound_used),
+        rebound_descendants,
         lists,
         list_items,
         buttons,
         texts,
         chat_windows,
+        mmui_elements,
+        wechat4_message_items,
         sample.join("|")
     )
 }
@@ -708,6 +838,31 @@ fn parse_message_nodes(
     items
         .iter()
         .filter_map(|item| parse_message_item(automation, item))
+        .collect()
+}
+
+#[cfg(windows)]
+fn parse_wechat4_message_nodes(
+    items: &[uiautomation::UIElement],
+    sender: &str,
+) -> Vec<UiMessageNode> {
+    items
+        .iter()
+        .filter_map(|item| {
+            let runtime_id = item
+                .get_runtime_id()
+                .ok()?
+                .into_iter()
+                .map(|part| part.to_string())
+                .collect::<Vec<_>>()
+                .join("-");
+            parse_wechat4_message_snapshot(
+                &item.get_classname().ok()?,
+                &item.get_name().ok()?,
+                &runtime_id,
+                sender,
+            )
+        })
         .collect()
 }
 
@@ -871,6 +1026,50 @@ mod tests {
     }
 
     #[test]
+    fn parses_wechat4_unread_session_labels() {
+        assert_eq!(
+            parse_wechat4_unread_session_label("\u{5f20}\u{4e09}\n[3\u{6761}]\n\u{4f60}\u{597d}"),
+            Some(WeChatSession {
+                name: "\u{5f20}\u{4e09}".to_string(),
+                unread_count: 3,
+            })
+        );
+        assert!(parse_wechat4_unread_session_label("\u{5f20}\u{4e09}\n\u{4f60}\u{597d}").is_none());
+    }
+
+    #[test]
+    fn parses_wechat4_message_items_from_mmui_snapshot() {
+        assert_eq!(
+            parse_wechat4_message_snapshot(
+                "mmui::ChatTextItemView",
+                "\u{4f60}\u{597d}",
+                "42-7",
+                "\u{5f20}\u{4e09}",
+            ),
+            Some(UiMessageNode {
+                runtime_id: "42-7".to_string(),
+                sender: "\u{5f20}\u{4e09}".to_string(),
+                content: "\u{4f60}\u{597d}".to_string(),
+                incoming: true,
+            })
+        );
+        assert!(parse_wechat4_message_snapshot(
+            "mmui::ChatSessionItemView",
+            "\u{5f20}\u{4e09}",
+            "42-8",
+            "\u{5f20}\u{4e09}",
+        )
+        .is_none());
+        assert!(parse_wechat4_message_snapshot(
+            "mmui::ChatSystemItemView",
+            "10:20",
+            "42-9",
+            "\u{5f20}\u{4e09}",
+        )
+        .is_none());
+    }
+
+    #[test]
     fn selects_only_the_latest_unread_message_items() {
         let items = ["old", "middle", "new"];
         assert_eq!(select_latest_messages(&items, 2), &["middle", "new"]);
@@ -921,6 +1120,14 @@ mod tests {
         assert!(should_prefer_raw_view(0, 4));
         assert!(!should_prefer_raw_view(4, 0));
         assert!(!should_prefer_raw_view(0, 0));
+    }
+
+    #[test]
+    fn prefers_handle_rebound_element_only_when_it_exposes_more_ui() {
+        assert!(should_use_handle_rebound(0, 12, false));
+        assert!(should_use_handle_rebound(0, 0, true));
+        assert!(!should_use_handle_rebound(8, 2, false));
+        assert!(!should_use_handle_rebound(0, 0, false));
     }
 
     #[test]

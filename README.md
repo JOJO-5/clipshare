@@ -18,7 +18,7 @@ ClipShare 是一个面向局域网的剪贴板共享工具，使用 Tauri、Reac
 - 文本、RGBA 图片和文件实时传输
 - TCP 服务端/客户端两种工作模式
 - 连接状态和传输日志
-- 微信消息提示：Win7 端通过 UI Automation 识别微信 `ChatWnd` 消息列表，Win10/11 端显示系统通知
+- 微信消息提示：Win7 端通过 UI Automation 识别旧版微信 `ChatWnd` 或微信 4.0 的 Qt/`mmui::*` 消息列表，Win10/11 端显示系统通知
 - 通知显示短摘要，点击后查看完整微信消息
 - 单条消息最大传输大小为 100 MB
 
@@ -29,7 +29,7 @@ ClipShare 是一个面向局域网的剪贴板共享工具，使用 Tauri、Reac
 - macOS：Intel 和 Apple Silicon
 - Linux：x64
 
-Win7 微信监听依赖 Windows UI Automation。程序优先定位 `ChatWnd` 下的消息列表项，使用消息控件的 Runtime ID 去重，并根据气泡位置过滤自己发送的消息；无法识别消息控件时才使用兼容回退。不同微信版本的 UI 控件结构可能不同，右下角通知气泡只有在微信将文本暴露给 UI Automation 时才能读取。华为云桌面需要保持用户会话运行，注销或没有交互桌面时监听可能暂停。
+Win7 微信监听依赖 Windows UI Automation。旧版微信优先定位 `ChatWnd`；微信 4.0 Qt 客户端会通过原生 HWND 重新连接 UIA Provider，再使用 Raw View 中的 `mmui::ChatSessionList`、`mmui::MessageView` 和 `mmui::Chat*ItemView`，根据未读会话数量提取最后的新消息，并使用 Runtime ID 去重。当前 4.0 兼容逻辑参考了公开的 wxauto4 4.0.5 控件结构；微信升级后控件名仍可能变化。日志中的 `handle_rebound_used`、`raw_descendants`、`mmui` 和 `wechat4_items` 可用于判断客户端是否向 UI Automation 暴露消息。华为云桌面需要保持用户会话运行，注销或没有交互桌面时监听可能暂停。
 
 ## 开发环境
 
