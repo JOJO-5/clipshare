@@ -62,6 +62,7 @@ pub fn start_server(
     let network = state.network.lock().unwrap();
     let logs = Arc::clone(&state.logs);
     let window_clone = window.clone();
+    install_network_status_logger(&network, Arc::clone(&state.logs), window.clone());
 
     network.start_server(port, move |data, msg_type| {
         let (data_type, content, size) = match msg_type {
@@ -114,6 +115,7 @@ pub fn connect_to_server(
     let network = state.network.lock().unwrap();
     let logs = Arc::clone(&state.logs);
     let window_clone = window.clone();
+    install_network_status_logger(&network, Arc::clone(&state.logs), window.clone());
 
     network.connect_to_server(&ip, port, move |data, msg_type| {
         let (data_type, content, size) = match msg_type {
@@ -154,6 +156,29 @@ pub fn connect_to_server(
             }
         }
     })
+}
+
+fn install_network_status_logger(
+    network: &NetworkManager,
+    logs: Arc<Mutex<Vec<LogEntry>>>,
+    window: tauri::Window,
+) {
+    network.set_status_handler(move |status, reason| {
+        let state = match status {
+            ConnectionStatus::Connected => "connected",
+            ConnectionStatus::Connecting => "connecting",
+            ConnectionStatus::Disconnected => "disconnected",
+        };
+        let entry = LogEntry::info(
+            "network",
+            &format!("network-status state={state} reason={reason}"),
+        );
+        entry.write_to_file().ok();
+        if let Ok(mut logs) = logs.lock() {
+            logs.push(entry.clone());
+        }
+        let _ = window.app_handle().emit("network-status-log", &entry);
+    });
 }
 
 #[command]

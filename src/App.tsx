@@ -39,6 +39,7 @@ function App() {
     let stopWeChat: (() => void) | undefined
     let stopWeChatMonitorLog: (() => void) | undefined
     let stopClipboardMonitorLog: (() => void) | undefined
+    let stopNetworkStatusLog: (() => void) | undefined
     let stopNotificationAction: (() => void) | undefined
     const appendLog = (entry: LogEntry) => setLogs(prev => [...prev.slice(-499), entry])
 
@@ -64,7 +65,7 @@ function App() {
         stopNotificationAction = undefined
       }
 
-      const [changed, received, wechat, wechatMonitorLog, clipboardMonitorLog] = await Promise.all([
+      const [changed, received, wechat, wechatMonitorLog, clipboardMonitorLog, networkStatusLog] = await Promise.all([
         listen<LogEntry>('clipboard-changed', event => appendLog(event.payload)),
         listen<LogEntry>('clipboard-received', event => {
           if (event.payload.dataType !== 'wechat') appendLog(event.payload)
@@ -99,6 +100,7 @@ function App() {
         }),
         listen<LogEntry>('wechat-monitor-log', event => appendLog(event.payload)),
         listen<LogEntry>('clipboard-monitor-log', event => appendLog(event.payload)),
+        listen<LogEntry>('network-status-log', event => appendLog(event.payload)),
       ])
       if (disposed) {
         changed()
@@ -106,6 +108,7 @@ function App() {
         wechat()
         wechatMonitorLog()
         clipboardMonitorLog()
+        networkStatusLog()
         return
       }
       stopChanged = changed
@@ -113,6 +116,7 @@ function App() {
       stopWeChat = wechat
       stopWeChatMonitorLog = wechatMonitorLog
       stopClipboardMonitorLog = clipboardMonitorLog
+      stopNetworkStatusLog = networkStatusLog
 
       try {
         const initialLogs = await invoke<LogEntry[]>('get_logs')
@@ -133,6 +137,7 @@ function App() {
       stopWeChat?.()
       stopWeChatMonitorLog?.()
       stopClipboardMonitorLog?.()
+      stopNetworkStatusLog?.()
       stopNotificationAction?.()
     }
   }, [notificationApi])
