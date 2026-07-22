@@ -1,15 +1,15 @@
-use tauri::{command, State, Manager, Emitter};
-use std::sync::{Mutex, Arc};
-use crate::network::ConnectionStatus;
-use crate::logger::LogEntry;
+use crate::autostart::set_autostart;
 use crate::clipboard::ClipboardListener;
-use crate::network::NetworkManager;
 use crate::config::AppConfig;
+use crate::logger::LogEntry;
+use crate::network::ConnectionStatus;
+use crate::network::NetworkManager;
 use crate::protocol::*;
 use crate::wechat_monitor::WeChatMonitor;
-use crate::autostart::set_autostart;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
+use tauri::{command, Emitter, Manager, State};
 
 pub struct AppState {
     pub network: Arc<Mutex<NetworkManager>>,
@@ -54,7 +54,11 @@ pub fn get_connection_status(state: State<AppState>) -> String {
 }
 
 #[command]
-pub fn start_server(port: u16, window: tauri::Window, state: State<AppState>) -> Result<(), String> {
+pub fn start_server(
+    port: u16,
+    window: tauri::Window,
+    state: State<AppState>,
+) -> Result<(), String> {
     let network = state.network.lock().unwrap();
     let logs = Arc::clone(&state.logs);
     let window_clone = window.clone();
@@ -74,7 +78,11 @@ pub fn start_server(port: u16, window: tauri::Window, state: State<AppState>) ->
                 Err(error) => ("error", error, 0),
             },
             TYPE_FILE => match save_received_file(&data) {
-                Ok(path) => ("file", format!("已保存: {}", path.display()), data.len() as u64),
+                Ok(path) => (
+                    "file",
+                    format!("已保存: {}", path.display()),
+                    data.len() as u64,
+                ),
                 Err(error) => ("error", error, 0),
             },
             TYPE_WECHAT => match decode_wechat(&data) {
@@ -97,7 +105,12 @@ pub fn start_server(port: u16, window: tauri::Window, state: State<AppState>) ->
 }
 
 #[command]
-pub fn connect_to_server(ip: String, port: u16, window: tauri::Window, state: State<AppState>) -> Result<(), String> {
+pub fn connect_to_server(
+    ip: String,
+    port: u16,
+    window: tauri::Window,
+    state: State<AppState>,
+) -> Result<(), String> {
     let network = state.network.lock().unwrap();
     let logs = Arc::clone(&state.logs);
     let window_clone = window.clone();
@@ -117,7 +130,11 @@ pub fn connect_to_server(ip: String, port: u16, window: tauri::Window, state: St
                 Err(error) => ("error", error, 0),
             },
             TYPE_FILE => match save_received_file(&data) {
-                Ok(path) => ("file", format!("已保存: {}", path.display()), data.len() as u64),
+                Ok(path) => (
+                    "file",
+                    format!("已保存: {}", path.display()),
+                    data.len() as u64,
+                ),
                 Err(error) => ("error", error, 0),
             },
             TYPE_WECHAT => match decode_wechat(&data) {
@@ -201,7 +218,8 @@ pub fn start_wechat_monitor(window: tauri::Window, state: State<AppState>) -> Re
                 .is_ok();
 
             if delivered {
-                let entry = LogEntry::send("wechat", &message.preview, message.content.len() as u64);
+                let entry =
+                    LogEntry::send("wechat", &message.preview, message.content.len() as u64);
                 entry.write_to_file().ok();
                 logs.lock().unwrap().push(entry);
                 let _ = window_clone.app_handle().emit("wechat-sent", &message);
@@ -223,7 +241,12 @@ pub fn start_wechat_monitor(window: tauri::Window, state: State<AppState>) -> Re
 }
 
 #[command]
-pub fn send_image(width: usize, height: usize, data: Vec<u8>, state: State<AppState>) -> Result<(), String> {
+pub fn send_image(
+    width: usize,
+    height: usize,
+    data: Vec<u8>,
+    state: State<AppState>,
+) -> Result<(), String> {
     let network = state.network.lock().unwrap();
     network.send_image(width, height, &data)?;
     let entry = LogEntry::send("image", "截图", data.len() as u64);
@@ -243,7 +266,10 @@ pub fn clear_logs(state: State<AppState>) {
 }
 
 #[command]
-pub fn start_clipboard_monitor(window: tauri::Window, state: State<AppState>) -> Result<(), String> {
+pub fn start_clipboard_monitor(
+    window: tauri::Window,
+    state: State<AppState>,
+) -> Result<(), String> {
     let mut listener_slot = state.clipboard_listener.lock().unwrap();
     if listener_slot.is_some() {
         return Ok(());
@@ -251,27 +277,39 @@ pub fn start_clipboard_monitor(window: tauri::Window, state: State<AppState>) ->
 
     let listener = ClipboardListener::new();
     let logs = Arc::clone(&state.logs);
+    let diagnostic_logs = Arc::clone(&state.logs);
     let network: Arc<Mutex<NetworkManager>> = Arc::clone(&state.network);
+    let window_clone = window.clone();
+    let diagnostic_window = window.clone();
 
-    listener.start(move |content| {
-        let data_type = content.data_type();
-        let summary = content.summary();
-        let size = content.size();
+    listener.start(
+        move |content| {
+            let data_type = content.data_type();
+            let summary = content.summary();
+            let size = content.size();
 
-        let delivered = network
-            .lock()
-            .map_err(|_| "Network state is unavailable".to_string())
-            .and_then(|net| send_clipboard_content(&net, content))
-            .is_ok();
+            let result = network
+                .lock()
+                .map_err(|_| "Network state is unavailable".to_string())
+                .and_then(|net| send_clipboard_content(&net, content));
 
-        if delivered {
-            let entry = LogEntry::send(data_type, &summary, size);
+            if result.is_ok() {
+                let entry = LogEntry::send(data_type, &summary, size);
+                entry.write_to_file().ok();
+                logs.lock().unwrap().push(entry.clone());
+                let _ = window_clone.app_handle().emit("clipboard-changed", &entry);
+            }
+            result
+        },
+        move |diagnostic| {
+            let entry = LogEntry::info("clipboard-monitor", &diagnostic);
             entry.write_to_file().ok();
-            logs.lock().unwrap().push(entry.clone());
-            let _ = window.app_handle().emit("clipboard-changed", &entry);
-        }
-        delivered
-    });
+            diagnostic_logs.lock().unwrap().push(entry.clone());
+            let _ = diagnostic_window
+                .app_handle()
+                .emit("clipboard-monitor-log", &entry);
+        },
+    );
 
     *listener_slot = Some(listener);
     Ok(())
@@ -287,9 +325,11 @@ fn send_clipboard_content(
 
     match content {
         crate::clipboard::ClipboardContent::Text(text) => network.send_text(&text),
-        crate::clipboard::ClipboardContent::Image { width, height, bytes } => {
-            network.send_image(width, height, &bytes)
-        }
+        crate::clipboard::ClipboardContent::Image {
+            width,
+            height,
+            bytes,
+        } => network.send_image(width, height, &bytes),
         crate::clipboard::ClipboardContent::Files(paths) => {
             for path in paths {
                 let file = std::path::Path::new(&path);

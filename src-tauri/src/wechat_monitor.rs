@@ -137,6 +137,10 @@ fn should_emit_tree_diagnostic(previous: Option<&str>, current: Option<&str>) ->
     current.is_some() && previous != current
 }
 
+fn should_prefer_raw_view(control_descendants: usize, raw_descendants: usize) -> bool {
+    control_descendants == 0 && raw_descendants > 0
+}
+
 pub fn messages_from_nodes(nodes: &[UiMessageNode]) -> Vec<WeChatMessage> {
     nodes
         .iter()
@@ -446,43 +450,35 @@ fn scan_wechat_window(
     automation: &uiautomation::UIAutomation,
     window: &uiautomation::UIElement,
 ) -> (Vec<WeChatMessage>, UiScanSummary) {
-    let walker = match automation.get_control_view_walker() {
+    let control_walker = match automation.get_control_view_walker() {
         Ok(walker) => walker,
         Err(_) => return (Vec::new(), UiScanSummary::default()),
     };
-    let mut lists = automation
-        .create_matcher()
-        .from_ref(window)
-        .control_type(uiautomation::controls::ControlType::List)
-        .depth(32)
-        .timeout(100)
-        .find_all()
-        .unwrap_or_default();
-
-    // wxauto obtains the main layout and then asks the session/chat boxes for
-    // their ListControl children. Some Win7 WeChat builds do not return these
-    // controls through a filtered matcher, while the control-view walker can
-    // still enumerate them. Keep the matcher fast path, then use the walker
-    // as the equivalent direct-tree fallback.
-    if lists.is_empty() {
-        lists = collect_ui_descendants(&walker, window, 1200)
-            .into_iter()
-            .filter(|element| {
-                element.get_control_type().ok() == Some(uiautomation::controls::ControlType::List)
-            })
-            .collect();
-    }
+    let raw_walker = automation.get_raw_view_walker().ok();
+    let control_descendants = collect_ui_descendants(&control_walker, window, 1200).len();
+    let raw_descendants = raw_walker
+        .as_ref()
+        .map(|walker| collect_ui_descendants(walker, window, 1200).len())
+        .unwrap_or(0);
+    let prefer_raw = should_prefer_raw_view(control_descendants, raw_descendants);
+    let tree_walker = if prefer_raw {
+        raw_walker.as_ref().unwrap_or(&control_walker)
+    } else {
+        &control_walker
+    };
+    let lists = find_wechat_lists(automation, tree_walker, window, prefer_raw);
 
     if !lists.is_empty() {
         let items = lists
             .iter()
-            .flat_map(|list| walker.get_children(list).unwrap_or_default())
+            .flat_map(|list| tree_walker.get_children(list).unwrap_or_default())
             .collect::<Vec<_>>();
         let mut session_names = HashSet::new();
         let unread_targets = items
             .iter()
             .filter_map(|item| {
-                let session = parse_unread_session_item_from_element(automation, &walker, item)?;
+                let session =
+                    parse_unread_session_item_from_element(automation, tree_walker, item)?;
                 if session_names.insert(session.name.clone()) {
                     Some((item, session))
                 } else {
@@ -501,17 +497,10 @@ fn scan_wechat_window(
             }
             opened_sessions += 1;
             thread::sleep(Duration::from_millis(120));
-            let current_lists = automation
-                .create_matcher()
-                .from_ref(window)
-                .control_type(uiautomation::controls::ControlType::List)
-                .depth(12)
-                .timeout(100)
-                .find_all()
-                .unwrap_or_default();
+            let current_lists = find_wechat_lists(automation, tree_walker, window, prefer_raw);
             let current_items = current_lists
                 .iter()
-                .flat_map(|list| walker.get_children(list).unwrap_or_default())
+                .flat_map(|list| tree_walker.get_children(list).unwrap_or_default())
                 .collect::<Vec<_>>();
             let current_nodes = parse_message_nodes(automation, &current_items);
             let latest_nodes = select_latest_messages(&current_nodes, session.unread_count);
@@ -529,15 +518,16 @@ fn scan_wechat_window(
                 parsed_nodes: nodes.len(),
                 incoming_nodes: nodes.iter().filter(|node| node.incoming).count(),
                 messages: messages.len(),
-                tree_diagnostic: (nodes.is_empty() && unread_sessions == 0)
-                    .then(|| format_ui_tree_diagnostic(&walker, window)),
+                tree_diagnostic: (nodes.is_empty() && unread_sessions == 0).then(|| {
+                    format_ui_tree_diagnostic(&control_walker, raw_walker.as_ref(), window)
+                }),
                 ..UiScanSummary::default()
             },
         );
     }
 
     let mut texts = Vec::new();
-    collect_ui_text(&walker, window, &mut texts);
+    collect_ui_text(tree_walker, window, &mut texts);
     let messages = extract_latest_message(&texts)
         .into_iter()
         .collect::<Vec<_>>();
@@ -546,10 +536,43 @@ fn scan_wechat_window(
         UiScanSummary {
             text_nodes: texts.len(),
             messages: messages.len(),
-            tree_diagnostic: Some(format_ui_tree_diagnostic(&walker, window)),
+            tree_diagnostic: Some(format_ui_tree_diagnostic(
+                &control_walker,
+                raw_walker.as_ref(),
+                window,
+            )),
             ..UiScanSummary::default()
         },
     )
+}
+
+#[cfg(windows)]
+fn find_wechat_lists(
+    automation: &uiautomation::UIAutomation,
+    walker: &uiautomation::UITreeWalker,
+    window: &uiautomation::UIElement,
+    prefer_raw: bool,
+) -> Vec<uiautomation::UIElement> {
+    if !prefer_raw {
+        let lists = automation
+            .create_matcher()
+            .from_ref(window)
+            .control_type(uiautomation::controls::ControlType::List)
+            .depth(32)
+            .timeout(100)
+            .find_all()
+            .unwrap_or_default();
+        if !lists.is_empty() {
+            return lists;
+        }
+    }
+
+    collect_ui_descendants(walker, window, 1200)
+        .into_iter()
+        .filter(|element| {
+            element.get_control_type().ok() == Some(uiautomation::controls::ControlType::List)
+        })
+        .collect()
 }
 
 #[cfg(windows)]
@@ -587,10 +610,19 @@ fn diagnostic_text(value: String, max_chars: usize) -> String {
 
 #[cfg(windows)]
 fn format_ui_tree_diagnostic(
-    walker: &uiautomation::UITreeWalker,
+    control_walker: &uiautomation::UITreeWalker,
+    raw_walker: Option<&uiautomation::UITreeWalker>,
     window: &uiautomation::UIElement,
 ) -> String {
-    let elements = collect_ui_descendants(walker, window, 1200);
+    let control_elements = collect_ui_descendants(control_walker, window, 1200);
+    let raw_elements = raw_walker
+        .map(|walker| collect_ui_descendants(walker, window, 1200))
+        .unwrap_or_default();
+    let elements = if should_prefer_raw_view(control_elements.len(), raw_elements.len()) {
+        &raw_elements
+    } else {
+        &control_elements
+    };
     let mut lists = 0;
     let mut list_items = 0;
     let mut buttons = 0;
@@ -598,7 +630,7 @@ fn format_ui_tree_diagnostic(
     let mut chat_windows = 0;
     let mut sample = Vec::new();
 
-    for element in &elements {
+    for element in elements.iter() {
         let control_type = element.get_control_type().ok();
         match control_type {
             Some(uiautomation::controls::ControlType::List) => lists += 1,
@@ -628,9 +660,11 @@ fn format_ui_tree_diagnostic(
     }
 
     format!(
-        "wechat-ui-tree root_class={} root_name={} descendants={} lists={} list_items={} buttons={} texts={} chatwnd={} sample={}",
+        "wechat-ui-tree root_class={} root_name={} control_descendants={} raw_descendants={} descendants={} lists={} list_items={} buttons={} texts={} chatwnd={} sample={}",
         diagnostic_text(window.get_classname().unwrap_or_default(), 40),
         diagnostic_text(window.get_name().unwrap_or_default(), 40),
+        control_elements.len(),
+        raw_elements.len(),
         elements.len(),
         lists,
         list_items,
@@ -880,6 +914,13 @@ mod tests {
         assert!(!should_emit_tree_diagnostic(Some("tree-a"), Some("tree-a")));
         assert!(should_emit_tree_diagnostic(Some("tree-a"), Some("tree-b")));
         assert!(!should_emit_tree_diagnostic(Some("tree-a"), None));
+    }
+
+    #[test]
+    fn prefers_raw_ui_tree_when_control_view_is_empty() {
+        assert!(should_prefer_raw_view(0, 4));
+        assert!(!should_prefer_raw_view(4, 0));
+        assert!(!should_prefer_raw_view(0, 0));
     }
 
     #[test]

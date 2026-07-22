@@ -1,8 +1,23 @@
+use std::time::{Duration, Instant};
+
 #[derive(Debug, Clone)]
 pub enum ClipboardContent {
     Text(String),
-    Image { width: usize, height: usize, bytes: Vec<u8> },
+    Image {
+        width: usize,
+        height: usize,
+        bytes: Vec<u8>,
+    },
     Files(Vec<String>),
+}
+
+fn should_retry_observation(
+    current: &str,
+    delivered: &str,
+    attempted: &str,
+    retry_elapsed: bool,
+) -> bool {
+    current != delivered && (current != attempted || retry_elapsed)
 }
 
 impl ClipboardContent {
@@ -17,7 +32,11 @@ impl ClipboardContent {
     pub fn summary(&self) -> String {
         match self {
             ClipboardContent::Text(t) => {
-                if t.len() > 20 { format!("{}...", &t[..20]) } else { t.clone() }
+                if t.len() > 20 {
+                    format!("{}...", &t[..20])
+                } else {
+                    t.clone()
+                }
             }
             ClipboardContent::Image { .. } => "图片".to_string(),
             ClipboardContent::Files(v) => v.join(", "),
@@ -28,9 +47,10 @@ impl ClipboardContent {
         match self {
             ClipboardContent::Text(t) => t.len() as u64,
             ClipboardContent::Image { bytes, .. } => bytes.len() as u64,
-            ClipboardContent::Files(v) => v.iter().map(|p| {
-                std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)
-            }).sum(),
+            ClipboardContent::Files(v) => v
+                .iter()
+                .map(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0))
+                .sum(),
         }
     }
 
@@ -84,7 +104,11 @@ pub fn set_image(width: usize, height: usize, bytes: Vec<u8>) -> Result<(), Stri
 
     let mut clipboard = arboard::Clipboard::new().map_err(|error| error.to_string())?;
     clipboard
-        .set_image(arboard::ImageData { width, height, bytes: Cow::Owned(bytes) })
+        .set_image(arboard::ImageData {
+            width,
+            height,
+            bytes: Cow::Owned(bytes),
+        })
         .map_err(|error| error.to_string())
 }
 
@@ -93,34 +117,88 @@ pub struct ClipboardListener;
 
 #[cfg(windows)]
 impl ClipboardListener {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 
-    pub fn start<F>(&self, on_change: F)
+    pub fn start<F, D>(&self, on_change: F, on_diagnostic: D)
     where
-        F: Fn(ClipboardContent) -> bool + Send + 'static,
+        F: Fn(ClipboardContent) -> Result<(), String> + Send + 'static,
+        D: Fn(String) + Send + 'static,
     {
-        use clipboard_win::{formats::{FileList, Unicode}, get_clipboard};
+        use clipboard_win::{
+            formats::{FileList, Unicode},
+            get_clipboard,
+        };
 
         std::thread::spawn(move || {
+            const RETRY_INTERVAL: Duration = Duration::from_secs(2);
             let mut last_text = String::new();
+            let mut attempted_text = String::new();
+            let mut last_text_attempt = Instant::now() - RETRY_INTERVAL;
             let mut last_files: Vec<String> = Vec::new();
+            let mut attempted_files: Vec<String> = Vec::new();
+            let mut last_files_attempt = Instant::now() - RETRY_INTERVAL;
             let mut last_image: Vec<u8> = Vec::new();
+            let mut attempted_image: Vec<u8> = Vec::new();
+            let mut last_image_attempt = Instant::now() - RETRY_INTERVAL;
+
+            on_diagnostic("clipboard-monitor started interval=300ms retry=2s".to_string());
 
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(300));
 
                 if let Ok(text) = get_clipboard::<String, _>(Unicode) {
-                    if !text.is_empty() && text != last_text {
-                        if on_change(ClipboardContent::Text(text.clone())) {
-                            last_text = text;
+                    if !text.is_empty()
+                        && should_retry_observation(
+                            &text,
+                            &last_text,
+                            &attempted_text,
+                            last_text_attempt.elapsed() >= RETRY_INTERVAL,
+                        )
+                    {
+                        attempted_text = text.clone();
+                        last_text_attempt = Instant::now();
+                        let content = ClipboardContent::Text(text.clone());
+                        on_diagnostic(format!(
+                            "clipboard-read type=text size={} summary={}",
+                            content.size(),
+                            content.summary()
+                        ));
+                        match on_change(content) {
+                            Ok(()) => {
+                                last_text = text;
+                                on_diagnostic("clipboard-send type=text status=sent".to_string());
+                            }
+                            Err(error) => on_diagnostic(format!(
+                                "clipboard-send type=text status=failed error={error}"
+                            )),
                         }
                     }
                 }
 
                 if let Ok(files) = get_clipboard::<Vec<String>, _>(FileList) {
-                    if !files.is_empty() && files != last_files {
-                        if on_change(ClipboardContent::Files(files.clone())) {
-                            last_files = files;
+                    let retry_elapsed = last_files_attempt.elapsed() >= RETRY_INTERVAL;
+                    if !files.is_empty()
+                        && (files != last_files)
+                        && (files != attempted_files || retry_elapsed)
+                    {
+                        attempted_files = files.clone();
+                        last_files_attempt = Instant::now();
+                        let content = ClipboardContent::Files(files.clone());
+                        on_diagnostic(format!(
+                            "clipboard-read type=file size={} summary={}",
+                            content.size(),
+                            content.summary()
+                        ));
+                        match on_change(content) {
+                            Ok(()) => {
+                                last_files = files;
+                                on_diagnostic("clipboard-send type=file status=sent".to_string());
+                            }
+                            Err(error) => on_diagnostic(format!(
+                                "clipboard-send type=file status=failed error={error}"
+                            )),
                         }
                     }
                 }
@@ -130,9 +208,34 @@ impl ClipboardListener {
                         let width = image.width;
                         let height = image.height;
                         let bytes = image.bytes.into_owned();
-                        if !bytes.is_empty() && bytes != last_image {
-                            if on_change(ClipboardContent::Image { width, height, bytes: bytes.clone() }) {
-                                last_image = bytes;
+                        if !bytes.is_empty()
+                            && bytes != last_image
+                            && (bytes != attempted_image
+                                || last_image_attempt.elapsed() >= RETRY_INTERVAL)
+                        {
+                            attempted_image = bytes.clone();
+                            last_image_attempt = Instant::now();
+                            let content = ClipboardContent::Image {
+                                width,
+                                height,
+                                bytes: bytes.clone(),
+                            };
+                            on_diagnostic(format!(
+                                "clipboard-read type=image width={} height={} size={}",
+                                width,
+                                height,
+                                content.size()
+                            ));
+                            match on_change(content) {
+                                Ok(()) => {
+                                    last_image = bytes;
+                                    on_diagnostic(
+                                        "clipboard-send type=image status=sent".to_string(),
+                                    );
+                                }
+                                Err(error) => on_diagnostic(format!(
+                                    "clipboard-send type=image status=failed error={error}"
+                                )),
                             }
                         }
                     }
@@ -147,7 +250,26 @@ pub struct ClipboardListener;
 
 #[cfg(not(windows))]
 impl ClipboardListener {
-    pub fn new() -> Self { Self }
-    pub fn start<F>(&self, _on_change: F)
-    where F: Fn(ClipboardContent) -> bool + Send + 'static { }
+    pub fn new() -> Self {
+        Self
+    }
+    pub fn start<F, D>(&self, _on_change: F, _on_diagnostic: D)
+    where
+        F: Fn(ClipboardContent) -> Result<(), String> + Send + 'static,
+        D: Fn(String) + Send + 'static,
+    {
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retries_a_failed_clipboard_value_after_the_retry_interval() {
+        assert!(should_retry_observation("new", "old", "", false));
+        assert!(!should_retry_observation("new", "old", "new", false));
+        assert!(should_retry_observation("new", "old", "new", true));
+        assert!(!should_retry_observation("new", "new", "new", true));
+    }
 }
