@@ -30,6 +30,51 @@ struct UiScanSummary {
     tree_diagnostic: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct NativeAccessibilitySnapshot {
+    child_windows: usize,
+    class_names: Vec<String>,
+    target_process_id: u32,
+    current_process_id: u32,
+    msaa_root: bool,
+    msaa_nodes: usize,
+    texts: Vec<String>,
+    error: Option<String>,
+}
+
+fn should_use_msaa_fallback(control_descendants: usize, raw_descendants: usize) -> bool {
+    control_descendants == 0 && raw_descendants == 0
+}
+
+fn format_native_accessibility_diagnostic(snapshot: &NativeAccessibilitySnapshot) -> String {
+    let error = snapshot
+        .error
+        .as_deref()
+        .map(|value| diagnostic_text(value.to_string(), 80))
+        .unwrap_or_else(|| "none".to_string());
+    let sample = snapshot
+        .texts
+        .iter()
+        .take(12)
+        .map(|value| diagnostic_text(value.clone(), 32))
+        .collect::<Vec<_>>()
+        .join("|");
+
+    format!(
+        "native_children={} native_classes={} target_pid={} current_pid={} same_process={} msaa_root={} msaa_nodes={} msaa_texts={} msaa_error={} msaa_sample={}",
+        snapshot.child_windows,
+        snapshot.class_names.join("|"),
+        snapshot.target_process_id,
+        snapshot.current_process_id,
+        usize::from(snapshot.target_process_id == snapshot.current_process_id),
+        usize::from(snapshot.msaa_root),
+        snapshot.msaa_nodes,
+        snapshot.texts.len(),
+        error,
+        sample,
+    )
+}
+
 impl UiScanSummary {
     fn format_log(&self) -> String {
         format!(
@@ -558,6 +603,20 @@ fn scan_wechat_window(
         .as_ref()
         .map(|walker| collect_ui_descendants(walker, window, 1200).len())
         .unwrap_or(0);
+    let native_snapshot = if should_use_msaa_fallback(control_descendants, raw_descendants) {
+        window
+            .get_native_window_handle()
+            .ok()
+            .filter(|handle| !handle.is_invalid())
+            .map(|handle| {
+                let raw: isize = handle.into();
+                scan_native_accessibility(windows::Win32::Foundation::HWND(
+                    raw as *mut std::ffi::c_void,
+                ))
+            })
+    } else {
+        None
+    };
     let prefer_raw = should_prefer_raw_view(control_descendants, raw_descendants);
     let tree_walker = if prefer_raw {
         raw_walker.as_ref().unwrap_or(&control_walker)
@@ -630,6 +689,7 @@ fn scan_wechat_window(
                         rebound_attempted,
                         rebound_used,
                         rebound_descendants,
+                        native_snapshot.as_ref(),
                     )
                 }),
                 ..UiScanSummary::default()
@@ -639,9 +699,14 @@ fn scan_wechat_window(
 
     let mut texts = Vec::new();
     collect_ui_text(tree_walker, window, &mut texts);
-    let messages = extract_latest_message(&texts)
+    let mut messages = extract_latest_message(&texts)
         .into_iter()
         .collect::<Vec<_>>();
+    if messages.is_empty() {
+        if let Some(snapshot) = native_snapshot.as_ref() {
+            messages.extend(extract_latest_message(&snapshot.texts));
+        }
+    }
     (
         messages.clone(),
         UiScanSummary {
@@ -654,6 +719,7 @@ fn scan_wechat_window(
                 rebound_attempted,
                 rebound_used,
                 rebound_descendants,
+                native_snapshot.as_ref(),
             )),
             ..UiScanSummary::default()
         },
@@ -709,7 +775,6 @@ fn collect_ui_descendants(
     elements
 }
 
-#[cfg(windows)]
 fn diagnostic_text(value: String, max_chars: usize) -> String {
     let mut text = value
         .replace('\r', " ")
@@ -723,6 +788,190 @@ fn diagnostic_text(value: String, max_chars: usize) -> String {
 }
 
 #[cfg(windows)]
+struct NativeWindowEnumeration {
+    handles: Vec<windows::Win32::Foundation::HWND>,
+    class_names: Vec<String>,
+}
+
+#[cfg(windows)]
+unsafe extern "system" fn enumerate_native_child_window(
+    hwnd: windows::Win32::Foundation::HWND,
+    lparam: windows::Win32::Foundation::LPARAM,
+) -> windows::Win32::Foundation::BOOL {
+    let state = &mut *(lparam.0 as *mut NativeWindowEnumeration);
+    if state.handles.len() >= 256 {
+        return windows::Win32::Foundation::BOOL(0);
+    }
+    state.handles.push(hwnd);
+    push_native_window_class(hwnd, &mut state.class_names);
+    windows::Win32::Foundation::BOOL(1)
+}
+
+#[cfg(windows)]
+unsafe fn push_native_window_class(
+    hwnd: windows::Win32::Foundation::HWND,
+    class_names: &mut Vec<String>,
+) {
+    use windows::Win32::UI::WindowsAndMessaging::GetClassNameW;
+
+    let mut buffer = [0u16; 256];
+    let length = GetClassNameW(hwnd, &mut buffer);
+    if length <= 0 {
+        return;
+    }
+    let class_name = String::from_utf16_lossy(&buffer[..length as usize]);
+    if !class_name.is_empty() && !class_names.contains(&class_name) {
+        class_names.push(class_name);
+    }
+}
+
+#[cfg(windows)]
+fn scan_native_accessibility(
+    root: windows::Win32::Foundation::HWND,
+) -> NativeAccessibilitySnapshot {
+    use windows::Win32::Foundation::LPARAM;
+    use windows::Win32::UI::WindowsAndMessaging::{EnumChildWindows, GetWindowThreadProcessId};
+
+    let mut enumeration = NativeWindowEnumeration {
+        handles: Vec::new(),
+        class_names: Vec::new(),
+    };
+    unsafe {
+        push_native_window_class(root, &mut enumeration.class_names);
+        let _ = EnumChildWindows(
+            root,
+            Some(enumerate_native_child_window),
+            LPARAM(&mut enumeration as *mut NativeWindowEnumeration as isize),
+        );
+    }
+
+    let mut target_process_id = 0;
+    unsafe {
+        GetWindowThreadProcessId(root, Some(&mut target_process_id));
+    }
+    let child_windows = enumeration.handles.len();
+    let mut handles = Vec::with_capacity(child_windows + 1);
+    handles.push(root);
+    handles.extend(enumeration.handles.iter().copied());
+
+    let mut snapshot = NativeAccessibilitySnapshot {
+        child_windows,
+        class_names: enumeration.class_names,
+        target_process_id,
+        current_process_id: std::process::id(),
+        ..NativeAccessibilitySnapshot::default()
+    };
+    let mut text_seen = HashSet::new();
+    let mut first_error = None;
+
+    for (index, hwnd) in handles.into_iter().take(64).enumerate() {
+        match accessible_from_window(hwnd) {
+            Ok(accessible) => {
+                if index == 0 {
+                    snapshot.msaa_root = true;
+                }
+                collect_msaa_accessible(
+                    &accessible,
+                    0,
+                    &mut snapshot.msaa_nodes,
+                    &mut snapshot.texts,
+                    &mut text_seen,
+                );
+                if snapshot.msaa_nodes >= 600 {
+                    break;
+                }
+            }
+            Err(error) => {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+    }
+    if snapshot.msaa_nodes == 0 {
+        snapshot.error = first_error;
+    }
+    snapshot
+}
+
+#[cfg(windows)]
+fn accessible_from_window(
+    hwnd: windows::Win32::Foundation::HWND,
+) -> Result<windows::Win32::UI::Accessibility::IAccessible, String> {
+    use std::ffi::c_void;
+    use windows::core::Interface;
+    use windows::Win32::UI::Accessibility::{AccessibleObjectFromWindow, IAccessible};
+
+    const OBJID_CLIENT: u32 = 0xffff_fffc;
+    let mut raw = std::ptr::null_mut::<c_void>();
+    unsafe {
+        AccessibleObjectFromWindow(hwnd, OBJID_CLIENT, &IAccessible::IID, &mut raw)
+            .map_err(|error| error.to_string())?;
+        if raw.is_null() {
+            return Err("AccessibleObjectFromWindow returned null".to_string());
+        }
+        Ok(IAccessible::from_raw(raw))
+    }
+}
+
+#[cfg(windows)]
+fn collect_msaa_accessible(
+    accessible: &windows::Win32::UI::Accessibility::IAccessible,
+    depth: usize,
+    node_count: &mut usize,
+    texts: &mut Vec<String>,
+    text_seen: &mut HashSet<String>,
+) {
+    use windows::core::{Interface, VARIANT};
+    use windows::Win32::UI::Accessibility::IAccessible;
+
+    if depth > 12 || *node_count >= 600 {
+        return;
+    }
+    *node_count += 1;
+    let self_id = VARIANT::from(0i32);
+    collect_msaa_text(accessible, &self_id, texts, text_seen);
+
+    let child_count = unsafe { accessible.accChildCount().unwrap_or(0) }.clamp(0, 512) as usize;
+    for child_index in 1..=child_count {
+        if *node_count >= 600 {
+            break;
+        }
+        let child_id = VARIANT::from(child_index as i32);
+        *node_count += 1;
+        collect_msaa_text(accessible, &child_id, texts, text_seen);
+        let child = unsafe { accessible.get_accChild(&child_id) }
+            .ok()
+            .and_then(|dispatch| dispatch.cast::<IAccessible>().ok());
+        if let Some(child) = child {
+            collect_msaa_accessible(&child, depth + 1, node_count, texts, text_seen);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn collect_msaa_text(
+    accessible: &windows::Win32::UI::Accessibility::IAccessible,
+    child_id: &windows::core::VARIANT,
+    texts: &mut Vec<String>,
+    text_seen: &mut HashSet<String>,
+) {
+    let values = unsafe {
+        [
+            accessible.get_accName(child_id).ok(),
+            accessible.get_accValue(child_id).ok(),
+            accessible.get_accDescription(child_id).ok(),
+        ]
+    };
+    for value in values.into_iter().flatten() {
+        let text = value.to_string().trim().to_string();
+        if !text.is_empty() && text_seen.insert(text.clone()) && texts.len() < 200 {
+            texts.push(text);
+        }
+    }
+}
+
+#[cfg(windows)]
 fn format_ui_tree_diagnostic(
     control_walker: &uiautomation::UITreeWalker,
     raw_walker: Option<&uiautomation::UITreeWalker>,
@@ -730,6 +979,7 @@ fn format_ui_tree_diagnostic(
     rebound_attempted: bool,
     rebound_used: bool,
     rebound_descendants: usize,
+    native_snapshot: Option<&NativeAccessibilitySnapshot>,
 ) -> String {
     let control_elements = collect_ui_descendants(control_walker, window, 1200);
     let raw_elements = raw_walker
@@ -784,7 +1034,7 @@ fn format_ui_tree_diagnostic(
         }
     }
 
-    format!(
+    let mut diagnostic = format!(
         "wechat-ui-tree root_class={} root_name={} control_descendants={} raw_descendants={} descendants={} handle_rebound_attempted={} handle_rebound_used={} rebound_descendants={} lists={} list_items={} buttons={} texts={} chatwnd={} mmui={} wechat4_items={} sample={}",
         diagnostic_text(window.get_classname().unwrap_or_default(), 40),
         diagnostic_text(window.get_name().unwrap_or_default(), 40),
@@ -802,7 +1052,12 @@ fn format_ui_tree_diagnostic(
         mmui_elements,
         wechat4_message_items,
         sample.join("|")
-    )
+    );
+    if let Some(snapshot) = native_snapshot {
+        diagnostic.push(' ');
+        diagnostic.push_str(&format_native_accessibility_diagnostic(snapshot));
+    }
+    diagnostic
 }
 
 #[cfg(windows)]
@@ -1128,6 +1383,35 @@ mod tests {
         assert!(should_use_handle_rebound(0, 0, true));
         assert!(!should_use_handle_rebound(8, 2, false));
         assert!(!should_use_handle_rebound(0, 0, false));
+    }
+
+    #[test]
+    fn uses_msaa_fallback_only_when_uia_exposes_no_descendants() {
+        assert!(should_use_msaa_fallback(0, 0));
+        assert!(!should_use_msaa_fallback(1, 0));
+        assert!(!should_use_msaa_fallback(0, 1));
+    }
+
+    #[test]
+    fn formats_native_accessibility_diagnostic_for_remote_debugging() {
+        let snapshot = NativeAccessibilitySnapshot {
+            child_windows: 3,
+            class_names: vec![
+                "Qt51514QWindowIcon".to_string(),
+                "WeChatMainWndForPC".to_string(),
+            ],
+            target_process_id: 4242,
+            current_process_id: 3131,
+            msaa_root: true,
+            msaa_nodes: 12,
+            texts: vec!["张三".to_string(), "你好".to_string()],
+            error: Some("access denied".to_string()),
+        };
+
+        assert_eq!(
+            format_native_accessibility_diagnostic(&snapshot),
+            "native_children=3 native_classes=Qt51514QWindowIcon|WeChatMainWndForPC target_pid=4242 current_pid=3131 same_process=0 msaa_root=1 msaa_nodes=12 msaa_texts=2 msaa_error=access denied msaa_sample=张三|你好"
+        );
     }
 
     #[test]

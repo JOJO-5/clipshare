@@ -53,7 +53,7 @@ jobs:
         if: matrix.platform == 'windows-latest'
         run: |
           if ('${{ matrix.win7 }}' -eq 'true') {
-            rustup toolchain install nightly --profile minimal --component rust-src
+            rustup toolchain install nightly-2026-07-22 --profile minimal --component rust-src
           } else {
             rustup target add ${{ matrix.target }}
           }
@@ -79,7 +79,7 @@ jobs:
         run: |
           npm run build
           if ('${{ matrix.win7 }}' -eq 'true') {
-            $env:RUSTUP_TOOLCHAIN = 'nightly'
+            $env:RUSTUP_TOOLCHAIN = 'nightly-2026-07-22'
           }
           & .\tests\functional-regressions.ps1
           cargo test --manifest-path src-tauri/Cargo.toml --lib
@@ -88,7 +88,7 @@ jobs:
         if: matrix.win7 == true
         shell: pwsh
         run: |
-          $env:RUSTUP_TOOLCHAIN = 'nightly'
+          $env:RUSTUP_TOOLCHAIN = 'nightly-2026-07-22'
           npm run build
           $webviewVersion = '109.0.1518.78'
           $webviewUrl = 'https://api.nuget.org/v3-flatcontainer/webview2.runtime.x64/109.0.1518.78/webview2.runtime.x64.109.0.1518.78.nupkg'
@@ -111,6 +111,15 @@ jobs:
           }
           $env:TAURI_CONFIG = Get-Content -Raw src-tauri/tauri.win7.conf.json
           cargo build --manifest-path src-tauri/Cargo.toml --release --target ${{ matrix.target }} --bin clipshare --features win7-compat --locked
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vsInstall = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          $dumpbin = Get-ChildItem (Join-Path $vsInstall 'VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe') -File |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+          if ($null -eq $dumpbin) {
+            throw 'dumpbin.exe was not found for the Win7 import compatibility check.'
+          }
+          & .\tests\check-win7-imports.ps1 -BinaryPath "src-tauri\target\${{ matrix.target }}\release\clipshare.exe" -DumpbinPath $dumpbin.FullName
           $bundleTargetDir = 'src-tauri\target\x86_64-pc-windows-msvc\release'
           New-Item -ItemType Directory -Force -Path $bundleTargetDir | Out-Null
           Copy-Item -LiteralPath "src-tauri\target\${{ matrix.target }}\release\clipshare.exe" -Destination (Join-Path $bundleTargetDir 'clipshare.exe') -Force

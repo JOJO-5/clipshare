@@ -8,6 +8,7 @@
 - The Win7 flavor pins `uiautomation = 0.23.0` so the executable does not import the missing `combase.dll`.
 - The Win7 flavor also uses the `win7-compat` Cargo feature, which leaves the modern WinRT notification plugin out of that binary; Win10/11 remains the notification display endpoint.
 - The Win7 installer bundles the fixed WebView2 109 runtime because newer WebView2 bootstrapper versions call APIs that do not exist on Windows 7.
+- The Win7 executable links the Microsoft WebView2 SDK 1.0.1054.31 loader so it also starts on Windows 7 installations where `EventSetInformation` is absent. CI inspects the final PE import table to prevent this compatibility regression.
 - Client connections remain in `Connecting` and retry with backoff until the receiver is available. After a TCP disconnect, the client reconnects automatically and the server continues accepting a replacement client.
 - Connections now use a protocol ACK plus 5-second heartbeats. A silent or half-open peer is detected within about 15 seconds, and blocking connect/write operations have timeouts.
 - The log panel records `network-status` transitions and their reason, such as `protocol ack received`, `heartbeat timeout`, `peer closed connection`, or `send failed`.
@@ -32,7 +33,7 @@ ClipShare 是一个面向局域网的剪贴板共享工具，使用 Tauri、Reac
 - macOS：Intel 和 Apple Silicon
 - Linux：x64
 
-Win7 微信监听依赖 Windows UI Automation。旧版微信优先定位 `ChatWnd`；微信 4.0 Qt 客户端会通过原生 HWND 重新连接 UIA Provider，再使用 Raw View 中的 `mmui::ChatSessionList`、`mmui::MessageView` 和 `mmui::Chat*ItemView`，根据未读会话数量提取最后的新消息，并使用 Runtime ID 去重。当前 4.0 兼容逻辑参考了公开的 wxauto4 4.0.5 控件结构；微信升级后控件名仍可能变化。日志中的 `handle_rebound_used`、`raw_descendants`、`mmui` 和 `wechat4_items` 可用于判断客户端是否向 UI Automation 暴露消息。华为云桌面需要保持用户会话运行，注销或没有交互桌面时监听可能暂停。
+Win7 微信监听依赖 Windows UI Automation。旧版微信优先定位 `ChatWnd`；微信 4.0 Qt 客户端会通过原生 HWND 重新连接 UIA Provider，再使用 Raw View 中的 `mmui::ChatSessionList`、`mmui::MessageView` 和 `mmui::Chat*ItemView`，根据未读会话数量提取最后的新消息，并使用 Runtime ID 去重。若 Qt 客户端的 UIA Control/Raw View 都为空，程序会枚举原生子窗口并尝试 Win7 自带的 MSAA/`IAccessible` 兜底。当前 4.0 兼容逻辑参考了公开的 wxauto4 4.0.5 控件结构；微信升级后控件名仍可能变化。日志中的 `handle_rebound_used`、`raw_descendants`、`native_classes`、`msaa_nodes`、`msaa_error` 和 `msaa_sample` 可用于判断微信暴露了哪一层可访问性数据。华为云桌面需要保持用户会话运行，注销或没有交互桌面时监听可能暂停。
 
 ## 开发环境
 

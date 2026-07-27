@@ -27,6 +27,8 @@ windows = { version = "0.58", features = [
     "Win32_System_DataExchange",
     "Win32_Graphics_Gdi",
     "Win32_UI_Shell",
+    "Win32_UI_Accessibility",
+    "Win32_UI_WindowsAndMessaging",
     "Win32_System_Com",
 ] }
 uiautomation = { version = "=0.23.0", default-features = false, features = ["control", "event", "input", "process"] }
@@ -36,3 +38,6 @@ winreg = "0.55"
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
 win7-compat = []
+
+[patch.crates-io]
+webview2-com-sys = { path = "vendor/webview2-com-sys-0.38.2-win7" }
