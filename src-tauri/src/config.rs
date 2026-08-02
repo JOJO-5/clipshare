@@ -28,6 +28,12 @@ pub struct AppConfig {
     pub autostart: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StartupConnection {
+    Server { port: u16 },
+    Client { ip: String, port: u16 },
+}
+
 fn default_role() -> String { "server".to_string() }
 fn default_port() -> u16 { 9527 }
 fn default_max_file_size() -> u64 { 104857600 }
@@ -54,6 +60,50 @@ impl Default for AppConfig {
 }
 
 impl AppConfig {
+    pub fn remember_server_connection(&mut self, port: u16) -> Result<(), String> {
+        if port == 0 {
+            return Err("Server port is invalid".to_string());
+        }
+        self.role = "server".to_string();
+        self.port = port;
+        Ok(())
+    }
+
+    pub fn remember_client_connection(&mut self, ip: &str, port: u16) -> Result<(), String> {
+        let ip = ip.trim();
+        if ip.is_empty() {
+            return Err("Client target IP is empty".to_string());
+        }
+        if port == 0 {
+            return Err("Client target port is invalid".to_string());
+        }
+        self.role = "client".to_string();
+        self.target_ip = ip.to_string();
+        self.target_port = port;
+        Ok(())
+    }
+
+    pub fn startup_connection(&self) -> Result<StartupConnection, String> {
+        match self.role.as_str() {
+            "server" if self.port > 0 => Ok(StartupConnection::Server { port: self.port }),
+            "server" => Err("Saved server port is invalid".to_string()),
+            "client" => {
+                let ip = self.target_ip.trim();
+                if ip.is_empty() {
+                    return Err("Saved client target IP is empty".to_string());
+                }
+                if self.target_port == 0 {
+                    return Err("Saved client target port is invalid".to_string());
+                }
+                Ok(StartupConnection::Client {
+                    ip: ip.to_string(),
+                    port: self.target_port,
+                })
+            }
+            role => Err(format!("Saved connection role is invalid: {role}")),
+        }
+    }
+
     pub fn config_dir() -> PathBuf {
         dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))
@@ -123,5 +173,81 @@ mod tests {
         assert_eq!(config.port, 9527);
         assert_eq!(config.max_file_size, 104857600);
         assert_eq!(config.language, "zh-CN");
+    }
+
+    #[test]
+    fn saved_server_config_restores_listening_on_startup() {
+        let config = AppConfig {
+            role: "server".to_string(),
+            port: 18789,
+            ..AppConfig::default()
+        };
+
+        assert_eq!(
+            config.startup_connection().unwrap(),
+            StartupConnection::Server { port: 18789 }
+        );
+    }
+
+    #[test]
+    fn saved_client_config_restores_target_on_startup() {
+        let config = AppConfig {
+            role: "client".to_string(),
+            target_ip: " 192.168.1.20 ".to_string(),
+            target_port: 18789,
+            ..AppConfig::default()
+        };
+
+        assert_eq!(
+            config.startup_connection().unwrap(),
+            StartupConnection::Client {
+                ip: "192.168.1.20".to_string(),
+                port: 18789,
+            }
+        );
+    }
+
+    #[test]
+    fn client_startup_rejects_an_empty_saved_target() {
+        let config = AppConfig {
+            role: "client".to_string(),
+            target_ip: "   ".to_string(),
+            ..AppConfig::default()
+        };
+
+        assert_eq!(
+            config.startup_connection().unwrap_err(),
+            "Saved client target IP is empty"
+        );
+    }
+
+    #[test]
+    fn manual_client_connection_becomes_the_next_startup_target() {
+        let mut config = AppConfig::default();
+
+        config
+            .remember_client_connection(" 10.0.0.8 ", 18789)
+            .unwrap();
+
+        assert_eq!(config.role, "client");
+        assert_eq!(config.target_ip, "10.0.0.8");
+        assert_eq!(config.target_port, 18789);
+        assert_eq!(
+            config.startup_connection().unwrap(),
+            StartupConnection::Client {
+                ip: "10.0.0.8".to_string(),
+                port: 18789,
+            }
+        );
+    }
+
+    #[test]
+    fn manual_server_start_becomes_the_next_startup_listener() {
+        let mut config = AppConfig::default();
+
+        config.remember_server_connection(18789).unwrap();
+
+        assert_eq!(config.role, "server");
+        assert_eq!(config.port, 18789);
     }
 }

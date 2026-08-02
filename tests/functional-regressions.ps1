@@ -8,6 +8,8 @@ $wechatMonitor = Get-Content -LiteralPath (Join-Path $repoRoot 'src-tauri\src\we
 $workflow = Get-Content -LiteralPath (Join-Path $repoRoot '.github\workflows\build.yml') -Raw
 $packageJson = Get-Content -LiteralPath (Join-Path $repoRoot 'package.json') -Raw
 $cargoManifest = Get-Content -LiteralPath (Join-Path $repoRoot 'src-tauri\Cargo.toml') -Raw
+$lib = Get-Content -LiteralPath (Join-Path $repoRoot 'src-tauri\src\lib.rs') -Raw
+$config = Get-Content -LiteralPath (Join-Path $repoRoot 'src-tauri\src\config.rs') -Raw
 
 if ($configPanel -notmatch 'getFieldsValue\(true\)') {
     throw 'Config save must include unmounted fields such as port.'
@@ -38,6 +40,12 @@ if ($workflow -notmatch 'check-win7-imports\.ps1') {
 }
 if ($cargoManifest -notmatch 'webview2-com-sys-0\.38\.2-win7') {
     throw 'Cargo must patch webview2-com-sys to use the loader that supports unpatched Windows 7.'
+}
+if ($lib -notmatch 'restore_saved_connection') {
+    throw 'Application startup must restore the saved server/client connection role.'
+}
+if ($config -notmatch 'remember_client_connection' -or $config -notmatch 'remember_server_connection') {
+    throw 'Manual connection actions must persist the endpoint used for the next startup.'
 }
 
 Write-Output 'Functional regression contracts are present.'

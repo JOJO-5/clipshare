@@ -10,6 +10,7 @@
 - The Win7 installer bundles the fixed WebView2 109 runtime because newer WebView2 bootstrapper versions call APIs that do not exist on Windows 7.
 - The Win7 executable links the Microsoft WebView2 SDK 1.0.1054.31 loader so it also starts on Windows 7 installations where `EventSetInformation` is absent. CI inspects the final PE import table to prevent this compatibility regression.
 - Client connections remain in `Connecting` and retry with backoff until the receiver is available. After a TCP disconnect, the client reconnects automatically and the server continues accepting a replacement client.
+- On every launch, ClipShare restores the last saved role automatically: receivers resume listening and senders reconnect to the last target. Clicking “Start listening” or “Connect” also persists that endpoint for the next restart.
 - Connections now use a protocol ACK plus 5-second heartbeats. A silent or half-open peer is detected within about 15 seconds, and blocking connect/write operations have timeouts.
 - The log panel records `network-status` transitions and their reason, such as `protocol ack received`, `heartbeat timeout`, `peer closed connection`, or `send failed`.
 - Both peers must run this or a newer build because the protocol ACK and heartbeat checks are not compatible with older ClipShare builds.
@@ -119,7 +120,7 @@ npm run build
 3. 连接成功后，复制文本、图片或文件即可传输。
 4. 启用微信消息提示后，Win7 端检测到微信新消息会发送到监听端，Win10/11 端显示通知。
 
-默认端口为 `9527`。使用局域网 IP 连接时，请确保防火墙允许该端口的 TCP 入站连接。
+默认端口为 `9527`。成功执行一次“开始监听”或“连接设备”后，当前角色、IP 和端口会自动保存；后续启动时接收端自动监听、发送端自动连接。如果接收端尚未启动，发送端会保持重试。使用局域网 IP 连接时，请确保防火墙允许该端口的 TCP 入站连接。
 
 ## 项目结构
 

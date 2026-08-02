@@ -91,6 +91,14 @@ pub fn run() {
                 let _ = window.hide();
             }
 
+            let state = app.state::<AppState>();
+            if let Err(error) = restore_saved_connection(app.handle().clone(), state.inner()) {
+                let entry =
+                    crate::logger::LogEntry::error(&format!("network auto-start failed: {error}"));
+                entry.write_to_file().ok();
+                state.logs.lock().unwrap().push(entry);
+            }
+
             Ok(())
         })
         .on_window_event(move |window, event| match event {

@@ -1,6 +1,6 @@
 use crate::autostart::set_autostart;
 use crate::clipboard::ClipboardListener;
-use crate::config::AppConfig;
+use crate::config::{AppConfig, StartupConnection};
 use crate::logger::LogEntry;
 use crate::network::ConnectionStatus;
 use crate::network::NetworkManager;
@@ -59,10 +59,22 @@ pub fn start_server(
     window: tauri::Window,
     state: State<AppState>,
 ) -> Result<(), String> {
+    let mut config = AppConfig::load();
+    config.remember_server_connection(port)?;
+    config.save()?;
+    state.network.lock().unwrap().set_config(config);
+    start_server_with_state(port, window.app_handle().clone(), state.inner())
+}
+
+fn start_server_with_state(
+    port: u16,
+    app_handle: tauri::AppHandle,
+    state: &AppState,
+) -> Result<(), String> {
     let network = state.network.lock().unwrap();
     let logs = Arc::clone(&state.logs);
-    let window_clone = window.clone();
-    install_network_status_logger(&network, Arc::clone(&state.logs), window.clone());
+    let receive_app_handle = app_handle.clone();
+    install_network_status_logger(&network, Arc::clone(&state.logs), app_handle);
 
     network.start_server(port, move |data, msg_type| {
         let (data_type, content, size) = match msg_type {
@@ -96,10 +108,10 @@ pub fn start_server(
         let entry = LogEntry::recv(data_type, &content, size);
         entry.write_to_file().ok();
         logs.lock().unwrap().push(entry.clone());
-        let _ = window_clone.app_handle().emit("clipboard-received", &entry);
+        let _ = receive_app_handle.emit("clipboard-received", &entry);
         if msg_type == TYPE_WECHAT {
             if let Ok(message) = decode_wechat(&data) {
-                let _ = window_clone.app_handle().emit("wechat-received", &message);
+                let _ = receive_app_handle.emit("wechat-received", &message);
             }
         }
     })
@@ -112,12 +124,25 @@ pub fn connect_to_server(
     window: tauri::Window,
     state: State<AppState>,
 ) -> Result<(), String> {
+    let mut config = AppConfig::load();
+    config.remember_client_connection(&ip, port)?;
+    config.save()?;
+    state.network.lock().unwrap().set_config(config);
+    connect_to_server_with_state(&ip, port, window.app_handle().clone(), state.inner())
+}
+
+fn connect_to_server_with_state(
+    ip: &str,
+    port: u16,
+    app_handle: tauri::AppHandle,
+    state: &AppState,
+) -> Result<(), String> {
     let network = state.network.lock().unwrap();
     let logs = Arc::clone(&state.logs);
-    let window_clone = window.clone();
-    install_network_status_logger(&network, Arc::clone(&state.logs), window.clone());
+    let receive_app_handle = app_handle.clone();
+    install_network_status_logger(&network, Arc::clone(&state.logs), app_handle);
 
-    network.connect_to_server(&ip, port, move |data, msg_type| {
+    network.connect_to_server(ip, port, move |data, msg_type| {
         let (data_type, content, size) = match msg_type {
             TYPE_TEXT => {
                 let text = String::from_utf8_lossy(&data).to_string();
@@ -149,19 +174,43 @@ pub fn connect_to_server(
         let entry = LogEntry::recv(data_type, &content, size);
         entry.write_to_file().ok();
         logs.lock().unwrap().push(entry.clone());
-        let _ = window_clone.app_handle().emit("clipboard-received", &entry);
+        let _ = receive_app_handle.emit("clipboard-received", &entry);
         if msg_type == TYPE_WECHAT {
             if let Ok(message) = decode_wechat(&data) {
-                let _ = window_clone.app_handle().emit("wechat-received", &message);
+                let _ = receive_app_handle.emit("wechat-received", &message);
             }
         }
     })
 }
 
+pub fn restore_saved_connection(
+    app_handle: tauri::AppHandle,
+    state: &AppState,
+) -> Result<(), String> {
+    let config = AppConfig::load();
+    {
+        let network = state
+            .network
+            .lock()
+            .map_err(|_| "Network state is unavailable".to_string())?;
+        network.set_config(config.clone());
+        if network.get_status() != ConnectionStatus::Disconnected {
+            return Ok(());
+        }
+    }
+
+    match config.startup_connection()? {
+        StartupConnection::Server { port } => start_server_with_state(port, app_handle, state),
+        StartupConnection::Client { ip, port } => {
+            connect_to_server_with_state(&ip, port, app_handle, state)
+        }
+    }
+}
+
 fn install_network_status_logger(
     network: &NetworkManager,
     logs: Arc<Mutex<Vec<LogEntry>>>,
-    window: tauri::Window,
+    app_handle: tauri::AppHandle,
 ) {
     network.set_status_handler(move |status, reason| {
         let state = match status {
@@ -177,7 +226,7 @@ fn install_network_status_logger(
         if let Ok(mut logs) = logs.lock() {
             logs.push(entry.clone());
         }
-        let _ = window.app_handle().emit("network-status-log", &entry);
+        let _ = app_handle.emit("network-status-log", &entry);
     });
 }
 
