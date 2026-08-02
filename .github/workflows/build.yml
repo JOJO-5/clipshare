@@ -4,9 +4,13 @@ on:
   push:
     branches:
       - master
+      - 'agent/**'
     tags:
       - 'v*'
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -15,23 +19,44 @@ jobs:
       matrix:
         include:
           - platform: 'windows-latest'
+            target: 'x86_64-win7-windows-msvc'
+            config: 'src-tauri/tauri.win7.conf.json'
+            artifact: 'clipshare-win7-x64'
+            win7: true
+          - platform: 'windows-latest'
             target: 'x86_64-pc-windows-msvc'
+            config: 'src-tauri/tauri.modern.conf.json'
+            artifact: 'clipshare-windows-x64'
+            win7: false
           - platform: 'macos-latest'
             target: 'x86_64-apple-darwin'
+            config: ''
+            artifact: 'clipshare-macos-x64'
+            win7: false
           - platform: 'macos-latest'
             target: 'aarch64-apple-darwin'
+            config: ''
+            artifact: 'clipshare-macos-arm64'
+            win7: false
           - platform: 'ubuntu-24.04'
             target: 'x86_64-unknown-linux-gnu'
+            config: ''
+            artifact: 'clipshare-linux-x64'
+            win7: false
 
     runs-on: ${{ matrix.platform }}
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
       - name: Setup (Windows)
         if: matrix.platform == 'windows-latest'
         run: |
-          rustup target add ${{ matrix.target }}
-          cargo install tauri-cli --locked
+          if ('${{ matrix.win7 }}' -eq 'true') {
+            rustup toolchain install nightly-2026-07-22 --profile minimal --component rust-src
+          } else {
+            rustup target add ${{ matrix.target }}
+          }
           npm ci
 
       - name: Setup (Linux)
@@ -40,28 +65,99 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libjavascriptcoregtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libsoup-3.0-dev
           rustup target add ${{ matrix.target }}
-          cargo install tauri-cli --locked
           npm ci
 
       - name: Setup (macOS)
         if: matrix.platform == 'macos-latest'
         run: |
           rustup target add ${{ matrix.target }}
-          cargo install tauri-cli --locked
           npm ci
 
-      - name: Build
+      - name: Test (Windows)
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        run: |
+          npm run build
+          if ('${{ matrix.win7 }}' -eq 'true') {
+            $env:RUSTUP_TOOLCHAIN = 'nightly-2026-07-22'
+          }
+          & .\tests\functional-regressions.ps1
+          cargo test --manifest-path src-tauri/Cargo.toml --lib
+
+      - name: Build (Win7)
+        if: matrix.win7 == true
+        shell: pwsh
+        run: |
+          $env:RUSTUP_TOOLCHAIN = 'nightly-2026-07-22'
+          npm run build
+          $webviewVersion = '109.0.1518.78'
+          $webviewUrl = 'https://api.nuget.org/v3-flatcontainer/webview2.runtime.x64/109.0.1518.78/webview2.runtime.x64.109.0.1518.78.nupkg'
+          $webviewPackage = Join-Path $env:RUNNER_TEMP "webview2.runtime.x64.$webviewVersion.zip"
+          $webviewExtract = Join-Path $env:RUNNER_TEMP "webview2-runtime-$webviewVersion"
+          $webviewDir = Join-Path $pwd 'src-tauri\webview2-runtime'
+          New-Item -ItemType Directory -Force -Path $webviewDir | Out-Null
+          Invoke-WebRequest -UseBasicParsing -MaximumRedirection 5 -Uri $webviewUrl -OutFile $webviewPackage
+          Expand-Archive -LiteralPath $webviewPackage -DestinationPath $webviewExtract -Force
+          $webviewExecutable = Get-ChildItem -LiteralPath $webviewExtract -Recurse -File -Filter 'msedgewebview2.exe' | Select-Object -First 1
+          if ($null -eq $webviewExecutable) {
+            throw "WebView2 fixed runtime package does not contain msedgewebview2.exe."
+          }
+          Get-ChildItem -LiteralPath $webviewExecutable.Directory.FullName -Force | ForEach-Object {
+            Copy-Item -LiteralPath $_.FullName -Destination $webviewDir -Recurse -Force
+          }
+          $runtimeProductVersion = $webviewExecutable.VersionInfo.ProductVersion
+          if ($runtimeProductVersion -notlike '109.*') {
+            throw "Expected WebView2 109 runtime, found $runtimeProductVersion."
+          }
+          $env:TAURI_CONFIG = Get-Content -Raw src-tauri/tauri.win7.conf.json
+          cargo build --manifest-path src-tauri/Cargo.toml --release --target ${{ matrix.target }} --bin clipshare --features win7-compat --locked
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vsInstall = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          $dumpbin = Get-ChildItem (Join-Path $vsInstall 'VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe') -File |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+          if ($null -eq $dumpbin) {
+            throw 'dumpbin.exe was not found for the Win7 import compatibility check.'
+          }
+          & .\tests\check-win7-imports.ps1 -BinaryPath "src-tauri\target\${{ matrix.target }}\release\clipshare.exe" -DumpbinPath $dumpbin.FullName
+          $bundleTargetDir = 'src-tauri\target\x86_64-pc-windows-msvc\release'
+          New-Item -ItemType Directory -Force -Path $bundleTargetDir | Out-Null
+          Copy-Item -LiteralPath "src-tauri\target\${{ matrix.target }}\release\clipshare.exe" -Destination (Join-Path $bundleTargetDir 'clipshare.exe') -Force
+          npm run tauri bundle -- --target x86_64-pc-windows-msvc --config src-tauri/tauri.win7.conf.json --features win7-compat --bundles nsis --ci --no-sign
+
+      - name: Build (Windows)
+        if: matrix.platform == 'windows-latest' && matrix.win7 == false
+        shell: pwsh
+        run: |
+          npm run tauri build -- --target ${{ matrix.target }} --config ${{ matrix.config }}
+
+      - name: Build (Unix)
+        if: matrix.platform != 'windows-latest'
+        shell: bash
         run: |
           npm run tauri build -- --target ${{ matrix.target }}
 
-      - name: Upload artifacts
+      - name: Upload Win7 artifacts
+        if: matrix.win7 == true
         uses: actions/upload-artifact@v4
         with:
-          name: clipshare-${{ matrix.target }}
+          name: ${{ matrix.artifact }}
+          retention-days: 3
+          if-no-files-found: error
           path: |
-            src-tauri/target/${{ matrix.target }}/release/bundle/**/ClipShare*.exe
-            src-tauri/target/${{ matrix.target }}/release/bundle/**/ClipShare*.app.tar.gz
-            src-tauri/target/${{ matrix.target }}/release/clipshare
+            src-tauri/target/x86_64-pc-windows-msvc/release/bundle/**/*
+            src-tauri/target/${{ matrix.target }}/release/clipshare*
+
+      - name: Upload artifacts
+        if: matrix.win7 == false
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          retention-days: 3
+          if-no-files-found: error
+          path: |
+            src-tauri/target/${{ matrix.target }}/release/bundle/**/*
+            src-tauri/target/${{ matrix.target }}/release/clipshare*
 
   release:
     needs: build
@@ -80,10 +176,13 @@ jobs:
         uses: softprops/action-gh-release@v1
         with:
           files: |
-            artifacts/clipshare-x86_64-pc-windows-msvc/bundle/**/ClipShare*.exe
-            artifacts/clipshare-x86_64-apple-darwin/bundle/**/ClipShare*.app.tar.gz
-            artifacts/clipshare-aarch64-apple-darwin/bundle/**/ClipShare*.app.tar.gz
-            artifacts/clipshare-x86_64-unknown-linux-gnu/clipshare
+            artifacts/**/*.exe
+            artifacts/**/*.msi
+            artifacts/**/*.dmg
+            artifacts/**/*.app.tar.gz
+            artifacts/**/*.deb
+            artifacts/**/*.AppImage
+            artifacts/**/clipshare
           draft: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

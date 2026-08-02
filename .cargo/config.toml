@@ -1,0 +1,9 @@
+[unstable]
+build-std = ["std", "panic_abort"]
+
+[target.x86_64-win7-windows-msvc]
+rustflags = [
+    "-Aexplicit_builtin_cfgs_in_flags",
+    "--cfg",
+    "target_vendor=\"pc\"",
+]

@@ -12,6 +12,7 @@ const typeColors: Record<string, string> = {
   send: 'blue',
   recv: 'green',
   error: 'red',
+  info: 'cyan',
 }
 
 const dataTypeIcons: Record<string, string> = {
@@ -50,7 +51,7 @@ export function LogPanel({ logs, onClear }: LogPanelProps) {
               title={
                 <span>
                   <Tag color={typeColors[item.type]}>
-                    {item.type === 'send' ? '发送' : item.type === 'recv' ? '接收' : '错误'}
+                    {item.type === 'send' ? '发送' : item.type === 'recv' ? '接收' : item.type === 'info' ? '信息' : '错误'}
                   </Tag>
                   <span style={{ marginLeft: 8, color: '#666' }}>{formatTime(item.time)}</span>
                 </span>

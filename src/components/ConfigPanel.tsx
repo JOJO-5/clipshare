@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Button, Form, Input, InputNumber, Radio, Space, message } from 'antd'
+import { Button, Form, Input, InputNumber, Radio, Space, Switch, message } from 'antd'
 import { invoke } from '@tauri-apps/api/core'
 import { StatusIndicator } from './StatusIndicator'
 
@@ -9,6 +9,11 @@ interface Config {
   target_ip: string
   target_port: number
   max_file_size: number
+  wechat_enabled: boolean
+  wechat_preview_limit: number
+  wechat_show_content: boolean
+  minimize_to_tray: boolean
+  autostart: boolean
 }
 
 export function ConfigPanel() {
@@ -34,9 +39,24 @@ export function ConfigPanel() {
 
   const handleSave = async () => {
     try {
-      const values = form.getFieldsValue()
+      // `port` is not mounted while editing client mode, but the Rust command
+      // accepts a complete AppConfig. Include the preserved form store and
+      // fill any missing legacy values before crossing the Tauri IPC boundary.
+      const values = form.getFieldsValue(true)
       await invoke('save_config', {
-        config: { ...values, target_ip: values.target_ip || '', max_file_size: 104857600, language: 'zh-CN' },
+        config: {
+          role: values.role ?? 'server',
+          port: values.port ?? 9527,
+          target_ip: values.target_ip ?? '',
+          target_port: values.target_port ?? 9527,
+          max_file_size: values.max_file_size ?? 104857600,
+          language: 'zh-CN',
+          wechat_enabled: values.wechat_enabled ?? true,
+          wechat_preview_limit: values.wechat_preview_limit ?? 40,
+          wechat_show_content: values.wechat_show_content ?? true,
+          minimize_to_tray: values.minimize_to_tray ?? true,
+          autostart: values.autostart ?? false,
+        },
       })
       message.success('配置已保存')
     } catch (error) {
@@ -53,7 +73,7 @@ export function ConfigPanel() {
         message.success('已开始监听连接')
       } else {
         await invoke('connect_to_server', { ip: values.target_ip, port: values.target_port })
-        message.success('已连接到目标设备')
+        message.success('已开始连接，目标设备上线后会自动重连')
       }
     } catch (error) {
       if (error instanceof Error) message.error(`操作失败：${error.message}`)
@@ -72,7 +92,7 @@ export function ConfigPanel() {
     <div className="config-panel">
       <div className="config-scroll">
         <div className="section-kicker">连接设置</div>
-        <Form form={form} layout="vertical" initialValues={{ role: 'server', port: 9527, target_port: 9527, max_file_size: 104857600 }}>
+        <Form form={form} layout="vertical" initialValues={{ role: 'server', port: 9527, target_port: 9527, max_file_size: 104857600, wechat_enabled: true, wechat_preview_limit: 40, wechat_show_content: true, minimize_to_tray: true, autostart: false }}>
           <Form.Item name="role" label="运行模式">
             <Radio.Group className="role-switch">
               <Radio.Button value="server">接收端</Radio.Button>
@@ -99,6 +119,22 @@ export function ConfigPanel() {
 
           <Form.Item name="max_file_size" label="文件传输上限">
             <InputNumber disabled addonAfter="MB" value={100} className="form-control" />
+          </Form.Item>
+          <div className="section-kicker">微信消息提示</div>
+          <Form.Item name="wechat_enabled" label="启用微信消息提示" valuePropName="checked">
+            <Switch />
+          </Form.Item>
+          <Form.Item name="wechat_preview_limit" label="通知摘要长度">
+            <InputNumber min={1} max={200} addonAfter="字" className="form-control" />
+          </Form.Item>
+          <Form.Item name="wechat_show_content" label="点击后显示完整正文" valuePropName="checked">
+            <Switch />
+          </Form.Item>
+          <Form.Item name="minimize_to_tray" label="关闭或最小化时隐藏到托盘" valuePropName="checked">
+            <Switch />
+          </Form.Item>
+          <Form.Item name="autostart" label="开机自启（启动后最小化）" valuePropName="checked">
+            <Switch />
           </Form.Item>
         </Form>
       </div>

@@ -6,10 +6,13 @@ pub const TYPE_IMAGE: u8 = 0x02;
 pub const TYPE_FILE: u8 = 0x03;
 pub const TYPE_HEARTBEAT: u8 = 0x04;
 pub const TYPE_ACK: u8 = 0x05;
+pub const TYPE_WECHAT: u8 = 0x06;
 pub const CHUNK_SIZE: usize = 65536;
 pub const HEADER_SIZE: usize = 12;
 pub const COMPRESSED: u8 = 0x01;
 pub const NOT_COMPRESSED: u8 = 0x00;
+
+pub use crate::wechat::{decode_wechat, encode_wechat, prepare_wechat_message, WeChatMessage};
 
 #[derive(Debug, Clone)]
 pub struct MessageHeader {
@@ -137,4 +140,45 @@ pub fn decode_image(payload: &[u8]) -> Result<(usize, usize, Vec<u8>), String> {
         return Err("Image payload is invalid".to_string());
     }
     Ok((width, height, bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wechat_message_type_is_reserved_for_notifications() {
+        assert_eq!(TYPE_WECHAT, 0x06);
+    }
+
+    #[test]
+    fn wechat_payload_round_trips_full_message() {
+        let message = WeChatMessage {
+            id: "msg-1".to_string(),
+            sender: "张三".to_string(),
+            preview: "短摘要".to_string(),
+            content: "这是完整的微信消息正文".to_string(),
+            timestamp: 1_700_000_000,
+            unread_count: 2,
+        };
+
+        let encoded = encode_wechat(&message).unwrap();
+        assert_eq!(decode_wechat(&encoded).unwrap(), message);
+    }
+
+    #[test]
+    fn wechat_preview_is_truncated_without_changing_full_content() {
+        let message = WeChatMessage {
+            id: "msg-2".to_string(),
+            sender: "李四".to_string(),
+            preview: String::new(),
+            content: "这是一个超过通知显示长度的微信消息正文，用于测试摘要截断".to_string(),
+            timestamp: 1_700_000_001,
+            unread_count: 1,
+        };
+
+        let prepared = prepare_wechat_message(message, 12);
+        assert_eq!(prepared.preview, "这是一个超过通知显示长度…");
+        assert_eq!(prepared.content, "这是一个超过通知显示长度的微信消息正文，用于测试摘要截断");
+    }
 }
