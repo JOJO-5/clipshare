@@ -7,6 +7,9 @@
       "webviewInstallMode": {
         "type": "fixedRuntime",
         "path": "./webview2-runtime"
+      },
+      "nsis": {
+        "installerHooks": "./nsis/win7-installer-hooks.nsh"
       }
     }
   }

@@ -23,8 +23,47 @@ if ($wechatMonitor -notmatch 'ChatWnd') {
 if ($wechatMonitor -notmatch 'AccessibleObjectFromWindow' -or $wechatMonitor -notmatch 'msaa_nodes') {
     throw 'WeChat monitor must retain the HWND/MSAA fallback and its remote diagnostics.'
 }
+if ($wechatMonitor -notmatch 'item\.click\(\)') {
+    throw 'Active WeChat monitoring must open recognized unread sessions to read full messages.'
+}
+if ($wechatMonitor -notmatch 'should_monitor_session') {
+    throw 'WeChat unread sessions must be filtered before active opening.'
+}
+if ($wechatMonitor -notmatch 'contains\(&keyword\)') {
+    throw 'WeChat session filters must support fuzzy keyword matching.'
+}
+if ($wechatMonitor -notmatch 'SessionClickTracker') {
+    throw 'WeChat monitoring must prevent repeated clicks while a session remains unread.'
+}
+if ($wechatMonitor -notmatch 'monitor_thread\.join\(\)') {
+    throw 'Stopping WeChat monitoring must wait for its worker thread to exit.'
+}
+if ($commands -notmatch 'set_wechat_monitor_enabled') {
+    throw 'The WeChat notification switch must reconfigure the running monitor immediately.'
+}
+if ($commands -notmatch 'wechat-send status=failed') {
+    throw 'Failed WeChat notification delivery must be visible in diagnostics.'
+}
+if ($commands -notmatch 'pending_wechat_temp_path' -or $commands -notmatch 'pending_wechat_backup_path') {
+    throw 'Pending WeChat notifications must use temporary and backup files for crash-safe persistence.'
+}
+if ($commands -notmatch 'pending_wechat_path\(\),\s*pending_wechat_backup_path\(\),\s*pending_wechat_temp_path') {
+    throw 'Pending WeChat startup recovery must inspect the temporary file as well as the target and backup.'
+}
+if ($commands -notmatch 'max_by_key') {
+    throw 'Pending WeChat startup recovery must choose the newest valid queue candidate.'
+}
+if ($commands -notmatch 'wechat-pending-save failed' -or $commands -notmatch 'wechat-pending-load failed') {
+    throw 'Pending WeChat persistence failures must be logged.'
+}
 if ($workflow -match 'cargo install tauri-cli') {
     throw 'CI must use the npm-installed Tauri CLI instead of compiling tauri-cli with Cargo.'
+}
+if ($workflow -notmatch 'pull_request:') {
+    throw 'Pull requests must run the build workflow automatically.'
+}
+if ($workflow -notmatch 'win7-webview2-config\.ps1') {
+    throw 'CI must run the Win7 WebView2 configuration regression test.'
 }
 if ($packageJson -notmatch '"@tauri-apps/cli"') {
     throw 'CI must install the Tauri CLI through package-lock via npm ci.'

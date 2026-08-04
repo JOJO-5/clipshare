@@ -7,6 +7,9 @@ on:
       - 'agent/**'
     tags:
       - 'v*'
+  pull_request:
+    branches:
+      - master
   workflow_dispatch:
 
 permissions:
@@ -81,6 +84,7 @@ jobs:
           if ('${{ matrix.win7 }}' -eq 'true') {
             $env:RUSTUP_TOOLCHAIN = 'nightly-2026-07-22'
           }
+          & .\tests\win7-webview2-config.ps1
           & .\tests\functional-regressions.ps1
           cargo test --manifest-path src-tauri/Cargo.toml --lib
 

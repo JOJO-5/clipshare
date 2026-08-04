@@ -13,6 +13,32 @@ if ($installMode.path -notmatch 'webview2-runtime') {
     throw "Win7 fixed runtime path must point to webview2-runtime, found '$($installMode.path)'."
 }
 
+$installerHooks = $config.bundle.windows.nsis.installerHooks
+if ([string]::IsNullOrWhiteSpace($installerHooks)) {
+    throw 'Win7 NSIS installer must configure an installerHooks file.'
+}
+$hooksPath = Join-Path (Split-Path -Parent $configPath) $installerHooks
+if (-not (Test-Path -LiteralPath $hooksPath -PathType Leaf)) {
+    throw "Win7 NSIS installer hooks file was not found: '$hooksPath'."
+}
+
+$hooks = Get-Content -LiteralPath $hooksPath -Raw
+foreach ($requiredHookText in @(
+    'NSIS_HOOK_PREINSTALL',
+    'CheckIfAppIsRunning "clipshare.exe" "ClipShare"',
+    '$INSTDIR\webview2-runtime\msedge_elf.dll',
+    'MB_RETRYCANCEL',
+    'IDRETRY',
+    'Abort'
+)) {
+    if (-not $hooks.Contains($requiredHookText)) {
+        throw "Win7 installer hooks are missing '$requiredHookText'."
+    }
+}
+if ($hooks -match '(?i)taskkill.+msedgewebview2\.exe') {
+    throw 'Win7 installer hooks must not terminate every WebView2 process on the machine.'
+}
+
 $workflow = Get-Content -LiteralPath $workflowPath -Raw
 $win7BuildStart = $workflow.IndexOf('- name: Build (Win7)')
 $win7BuildEnd = $workflow.IndexOf('- name: Build (Windows)', $win7BuildStart)

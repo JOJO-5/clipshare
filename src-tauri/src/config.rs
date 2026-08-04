@@ -22,6 +22,8 @@ pub struct AppConfig {
     pub wechat_preview_limit: usize,
     #[serde(default)]
     pub wechat_show_content: bool,
+    #[serde(default)]
+    pub wechat_session_filter: String,
     #[serde(default = "default_true")]
     pub minimize_to_tray: bool,
     #[serde(default)]
@@ -34,12 +36,24 @@ pub enum StartupConnection {
     Client { ip: String, port: u16 },
 }
 
-fn default_role() -> String { "server".to_string() }
-fn default_port() -> u16 { 9527 }
-fn default_max_file_size() -> u64 { 104857600 }
-fn default_language() -> String { "zh-CN".to_string() }
-fn default_true() -> bool { true }
-fn default_preview_limit() -> usize { 40 }
+fn default_role() -> String {
+    "server".to_string()
+}
+fn default_port() -> u16 {
+    9527
+}
+fn default_max_file_size() -> u64 {
+    104857600
+}
+fn default_language() -> String {
+    "zh-CN".to_string()
+}
+fn default_true() -> bool {
+    true
+}
+fn default_preview_limit() -> usize {
+    40
+}
 
 impl Default for AppConfig {
     fn default() -> Self {
@@ -53,6 +67,7 @@ impl Default for AppConfig {
             wechat_enabled: true,
             wechat_preview_limit: 40,
             wechat_show_content: true,
+            wechat_session_filter: String::new(),
             minimize_to_tray: true,
             autostart: false,
         }
@@ -118,6 +133,10 @@ impl AppConfig {
         Self::config_dir().join("logs")
     }
 
+    pub fn pending_wechat_path() -> PathBuf {
+        Self::config_dir().join("wechat-pending.json")
+    }
+
     pub fn load() -> Self {
         let path = Self::config_path();
         if path.exists() {
@@ -151,6 +170,7 @@ mod tests {
         assert!(config.wechat_enabled);
         assert_eq!(config.wechat_preview_limit, 40);
         assert!(!config.wechat_show_content);
+        assert!(config.wechat_session_filter.is_empty());
         assert!(config.minimize_to_tray);
         assert!(!config.autostart);
     }
@@ -159,8 +179,14 @@ mod tests {
     fn default_config_persists_tray_and_autostart_preferences() {
         let value = serde_json::to_value(AppConfig::default()).unwrap();
 
-        assert_eq!(value.get("minimize_to_tray").and_then(|v| v.as_bool()), Some(true));
-        assert_eq!(value.get("autostart").and_then(|v| v.as_bool()), Some(false));
+        assert_eq!(
+            value.get("minimize_to_tray").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            value.get("autostart").and_then(|v| v.as_bool()),
+            Some(false)
+        );
     }
 
     #[test]
