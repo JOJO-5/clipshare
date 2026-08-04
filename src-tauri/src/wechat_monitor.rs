@@ -454,6 +454,27 @@ pub struct WeChatMonitor {
     stop: Arc<AtomicBool>,
 }
 
+#[derive(Debug, Default)]
+struct SessionClickTracker {
+    clicked_unread_ids: HashSet<String>,
+}
+
+impl SessionClickTracker {
+    fn sync_unread_ids(&mut self, unread_ids: &[String]) {
+        let current_ids = unread_ids.iter().collect::<HashSet<_>>();
+        self.clicked_unread_ids
+            .retain(|clicked_id| current_ids.contains(clicked_id));
+    }
+
+    fn was_clicked(&self, runtime_id: &str) -> bool {
+        self.clicked_unread_ids.contains(runtime_id)
+    }
+
+    fn mark_clicked(&mut self, runtime_id: &str) {
+        self.clicked_unread_ids.insert(runtime_id.to_string());
+    }
+}
+
 impl WeChatMonitor {
     pub fn start<F, D>(
         session_filter: String,
@@ -478,13 +499,15 @@ impl WeChatMonitor {
                 };
                 on_diagnostic("wechat-monitor UIA initialized".to_string());
                 let mut tracker = MessageTracker::default();
+                let mut click_tracker = SessionClickTracker::default();
                 let mut last_summary = None;
                 let mut last_tree_diagnostic = None;
                 let mut last_summary_log = Instant::now() - Duration::from_secs(5);
                 let mut last_pending_log = Instant::now() - Duration::from_secs(5);
 
                 while !thread_stop.load(Ordering::Relaxed) {
-                    let (messages, summary) = scan_wechat(&automation, &session_filter);
+                    let (messages, summary) =
+                        scan_wechat(&automation, &session_filter, &mut click_tracker);
                     if last_summary.as_ref() != Some(&summary)
                         || last_summary_log.elapsed() >= Duration::from_secs(5)
                     {
@@ -540,6 +563,7 @@ impl Drop for WeChatMonitor {
 fn scan_wechat(
     automation: &uiautomation::UIAutomation,
     session_filter: &str,
+    click_tracker: &mut SessionClickTracker,
 ) -> (Vec<WeChatMessage>, UiScanSummary) {
     let main_windows = find_wechat_main_windows(automation);
     let mut summary = UiScanSummary {
@@ -549,14 +573,14 @@ fn scan_wechat(
     let mut messages = Vec::new();
     for window in main_windows {
         let (window_messages, window_summary) =
-            scan_wechat_window(automation, &window, session_filter);
+            scan_wechat_window(automation, &window, session_filter, click_tracker);
         merge_scan_summary(&mut summary, &window_summary);
         messages.extend(window_messages);
     }
     if should_scan_wechat_fallback(&summary) {
         for window in find_wechat_windows(automation) {
             let (window_messages, window_summary) =
-                scan_wechat_window(automation, &window, session_filter);
+                scan_wechat_window(automation, &window, session_filter, click_tracker);
             summary.windows += 1;
             merge_scan_summary(&mut summary, &window_summary);
             messages.extend(window_messages);
@@ -677,6 +701,7 @@ fn scan_wechat_window(
     automation: &uiautomation::UIAutomation,
     window: &uiautomation::UIElement,
     session_filter: &str,
+    click_tracker: &mut SessionClickTracker,
 ) -> (Vec<WeChatMessage>, UiScanSummary) {
     let control_walker = match automation.get_control_view_walker() {
         Ok(walker) => walker,
@@ -770,7 +795,24 @@ fn scan_wechat_window(
             .collect::<Vec<_>>();
         let unread_sessions = unread_targets.len();
         let nodes = parse_message_nodes(automation, &items);
-        let mut messages = messages_from_nodes(&nodes);
+        let unread_runtime_ids = unread_targets
+            .iter()
+            .map(|(item, session)| {
+                item.get_runtime_id()
+                    .ok()
+                    .map(|parts| {
+                        parts
+                            .into_iter()
+                            .map(|part| part.to_string())
+                            .collect::<Vec<_>>()
+                            .join("-")
+                    })
+                    .filter(|runtime_id| !runtime_id.is_empty())
+                    .unwrap_or_else(|| format!("session:{}", session.name))
+            })
+            .collect::<Vec<_>>();
+        click_tracker.sync_unread_ids(&unread_runtime_ids);
+        let mut messages = Vec::new();
         let mut opened_sessions = 0;
         for (item, session) in unread_targets {
             let runtime_id = item
@@ -784,11 +826,15 @@ fn scan_wechat_window(
                         .join("-")
                 })
                 .filter(|runtime_id| !runtime_id.is_empty())
-                .unwrap_or_else(|| format!("{}-{}", session.name, session.unread_count));
+                .unwrap_or_else(|| format!("session:{}", session.name));
+            if click_tracker.was_clicked(&runtime_id) {
+                continue;
+            }
             if item.click().is_err() {
                 messages.extend(message_from_unread_session(&runtime_id, &session));
                 continue;
             }
+            click_tracker.mark_clicked(&runtime_id);
             opened_sessions += 1;
             let current_nodes = retry_until_nonempty(6, Duration::from_millis(100), || {
                 let current_lists = find_wechat_lists(automation, tree_walker, window, prefer_raw);
@@ -1479,6 +1525,23 @@ mod tests {
         assert!(should_monitor_session("Alice 2", filter));
         assert!(should_monitor_session("Main Project 🚀 Group", filter));
         assert!(!should_monitor_session("Other Group", filter));
+    }
+
+    #[test]
+    fn session_click_tracker_allows_one_click_until_unread_state_clears() {
+        let mut tracker = SessionClickTracker::default();
+        let unread = vec!["session-42".to_string()];
+
+        tracker.sync_unread_ids(&unread);
+        assert!(!tracker.was_clicked("session-42"));
+        tracker.mark_clicked("session-42");
+
+        tracker.sync_unread_ids(&unread);
+        assert!(tracker.was_clicked("session-42"));
+
+        tracker.sync_unread_ids(&[]);
+        tracker.sync_unread_ids(&unread);
+        assert!(!tracker.was_clicked("session-42"));
     }
 
     #[test]

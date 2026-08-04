@@ -32,6 +32,9 @@ if ($wechatMonitor -notmatch 'should_monitor_session') {
 if ($wechatMonitor -notmatch 'contains\(&keyword\)') {
     throw 'WeChat session filters must support fuzzy keyword matching.'
 }
+if ($wechatMonitor -notmatch 'SessionClickTracker') {
+    throw 'WeChat monitoring must prevent repeated clicks while a session remains unread.'
+}
 if ($commands -notmatch 'set_wechat_monitor_enabled') {
     throw 'The WeChat notification switch must reconfigure the running monitor immediately.'
 }
