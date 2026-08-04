@@ -5,17 +5,31 @@ use crate::logger::LogEntry;
 use crate::network::ConnectionStatus;
 use crate::network::NetworkManager;
 use crate::protocol::*;
-use crate::wechat_monitor::WeChatMonitor;
+use crate::wechat_monitor::{MessageTracker, WeChatMonitor};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 use tauri::{command, Emitter, Manager, State};
+
+fn load_pending_wechat_messages() -> Vec<WeChatMessage> {
+    std::fs::read_to_string(AppConfig::pending_wechat_path())
+        .ok()
+        .and_then(|content| serde_json::from_str(&content).ok())
+        .unwrap_or_default()
+}
+
+fn save_pending_wechat_messages(messages: &[WeChatMessage]) -> Result<(), String> {
+    std::fs::create_dir_all(AppConfig::config_dir()).map_err(|error| error.to_string())?;
+    let content = serde_json::to_string_pretty(messages).map_err(|error| error.to_string())?;
+    std::fs::write(AppConfig::pending_wechat_path(), content).map_err(|error| error.to_string())
+}
 
 pub struct AppState {
     pub network: Arc<Mutex<NetworkManager>>,
     pub logs: Arc<Mutex<Vec<LogEntry>>>,
     pub clipboard_listener: Mutex<Option<ClipboardListener>>,
     pub wechat_monitor: Mutex<Option<WeChatMonitor>>,
+    pub wechat_tracker: Arc<Mutex<MessageTracker>>,
 }
 
 impl Default for AppState {
@@ -25,6 +39,9 @@ impl Default for AppState {
             logs: Arc::new(Mutex::new(Vec::new())),
             clipboard_listener: Mutex::new(None),
             wechat_monitor: Mutex::new(None),
+            wechat_tracker: Arc::new(Mutex::new(MessageTracker::with_pending(
+                load_pending_wechat_messages(),
+            ))),
         }
     }
 }
@@ -327,12 +344,14 @@ fn start_wechat_monitor_with_config(
     let logs = Arc::clone(&state.logs);
     let diagnostic_logs = Arc::clone(&state.logs);
     let network = Arc::clone(&state.network);
+    let tracker = Arc::clone(&state.wechat_tracker);
     let window_clone = window.clone();
     let diagnostic_window = window.clone();
     let last_delivery_failure = Arc::new(Mutex::new(None));
     let preview_limit = config.wechat_preview_limit.max(1);
     let monitor = WeChatMonitor::start(
         config.wechat_session_filter.clone(),
+        tracker,
         move |message| {
             let message = prepare_wechat_message(message, preview_limit);
             let delivery = network
@@ -388,6 +407,9 @@ fn start_wechat_monitor_with_config(
             let _ = diagnostic_window
                 .app_handle()
                 .emit("wechat-monitor-log", &entry);
+        },
+        move |pending| {
+            let _ = save_pending_wechat_messages(&pending);
         },
     )?;
 

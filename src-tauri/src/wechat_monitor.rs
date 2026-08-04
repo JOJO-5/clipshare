@@ -2,7 +2,7 @@ use crate::wechat::WeChatMessage;
 use std::collections::{HashSet, VecDeque};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 use std::thread;
 use std::time::{Duration, Instant};
@@ -286,14 +286,19 @@ fn parse_wechat4_message_snapshot(
     })
 }
 
-fn retry_until_nonempty<T, F>(attempts: usize, delay: Duration, mut scan: F) -> Vec<T>
+fn retry_until_minimum<T, F>(
+    attempts: usize,
+    delay: Duration,
+    minimum: usize,
+    mut scan: F,
+) -> Vec<T>
 where
     F: FnMut() -> Vec<T>,
 {
     let attempts = attempts.max(1);
     for attempt in 0..attempts {
         let values = scan();
-        if !values.is_empty() {
+        if values.len() >= minimum {
             return values;
         }
         if attempt + 1 < attempts && !delay.is_zero() {
@@ -352,14 +357,23 @@ fn messages_from_opened_session(
             .collect();
     }
     let start = messages.len().saturating_sub(session.unread_count);
-    messages[start..]
+    let mut selected = messages[start..]
         .iter()
         .cloned()
         .map(|mut message| {
             message.id = format!("wechat-unread-{}-{}", runtime_id, message.id);
             message
         })
-        .collect()
+        .collect::<Vec<_>>();
+    if selected.len() < session.unread_count {
+        if let Some(mut fallback) = message_from_unread_session(runtime_id, session) {
+            fallback.id = format!("{}-partial-{}", fallback.id, selected.len());
+            fallback.unread_count =
+                (session.unread_count - selected.len()).min(u32::MAX as usize) as u32;
+            selected.push(fallback);
+        }
+    }
+    selected
 }
 
 #[derive(Debug, Default)]
@@ -370,6 +384,14 @@ pub struct MessageTracker {
 }
 
 impl MessageTracker {
+    pub fn with_pending(pending_messages: Vec<WeChatMessage>) -> Self {
+        Self {
+            initialized: true,
+            delivered_ids: HashSet::new(),
+            pending_messages,
+        }
+    }
+
     pub fn ingest(&mut self, messages: Vec<WeChatMessage>) -> Vec<WeChatMessage> {
         let current_ids = messages
             .iter()
@@ -408,6 +430,10 @@ impl MessageTracker {
     pub fn mark_delivered(&mut self, id: &str) {
         self.pending_messages.retain(|message| message.id != id);
         self.delivered_ids.insert(id.to_string());
+    }
+
+    pub fn pending_messages(&self) -> Vec<WeChatMessage> {
+        self.pending_messages.clone()
     }
 }
 
@@ -485,8 +511,10 @@ impl SessionClickTracker {
 impl WeChatMonitor {
     pub fn start<F, D>(
         session_filter: String,
+        tracker: Arc<Mutex<MessageTracker>>,
         on_message: F,
         on_diagnostic: D,
+        on_pending: impl Fn(Vec<WeChatMessage>) + Send + 'static,
     ) -> Result<Self, String>
     where
         F: Fn(WeChatMessage) -> bool + Send + 'static,
@@ -505,7 +533,6 @@ impl WeChatMonitor {
                     }
                 };
                 on_diagnostic("wechat-monitor UIA initialized".to_string());
-                let mut tracker = MessageTracker::default();
                 let mut click_tracker = SessionClickTracker::default();
                 let mut last_summary = None;
                 let mut last_tree_diagnostic = None;
@@ -532,7 +559,10 @@ impl WeChatMonitor {
                         }
                     }
 
-                    let pending = tracker.ingest(messages);
+                    let pending = tracker
+                        .lock()
+                        .map(|mut tracker| tracker.ingest(messages))
+                        .unwrap_or_default();
                     if !pending.is_empty() && last_pending_log.elapsed() >= Duration::from_secs(5) {
                         on_diagnostic(format!(
                             "wechat-monitor incoming messages pending_delivery={}",
@@ -542,8 +572,15 @@ impl WeChatMonitor {
                     }
                     for message in pending {
                         if on_message(message.clone()) {
-                            tracker.mark_delivered(&message.id);
+                            if let Ok(mut tracker) = tracker.lock() {
+                                tracker.mark_delivered(&message.id);
+                            }
                         }
+                        let remaining = tracker
+                            .lock()
+                            .map(|tracker| tracker.pending_messages())
+                            .unwrap_or_default();
+                        on_pending(remaining);
                     }
                     thread::sleep(Duration::from_millis(500));
                 }
@@ -558,6 +595,7 @@ impl WeChatMonitor {
         {
             let _ = on_message;
             let _ = on_diagnostic;
+            let _ = on_pending;
             Err("微信监听仅支持 Windows".to_string())
         }
     }
@@ -851,19 +889,25 @@ fn scan_wechat_window(
             }
             click_tracker.mark_clicked(&runtime_id);
             opened_sessions += 1;
-            let current_nodes = retry_until_nonempty(6, Duration::from_millis(100), || {
-                let current_lists = find_wechat_lists(automation, tree_walker, window, prefer_raw);
-                let current_items = current_lists
-                    .iter()
-                    .flat_map(|list| tree_walker.get_children(list).unwrap_or_default())
-                    .collect::<Vec<_>>();
-                let wechat4_nodes = parse_wechat4_message_nodes(&current_items, &session.name);
-                if wechat4_nodes.is_empty() {
-                    parse_message_nodes(automation, &current_items)
-                } else {
-                    wechat4_nodes
-                }
-            });
+            let current_nodes =
+                retry_until_minimum(6, Duration::from_millis(100), session.unread_count, || {
+                    let current_lists =
+                        find_wechat_lists(automation, tree_walker, window, prefer_raw);
+                    let current_items = current_lists
+                        .iter()
+                        .flat_map(|list| tree_walker.get_children(list).unwrap_or_default())
+                        .collect::<Vec<_>>();
+                    let wechat4_nodes = parse_wechat4_message_nodes(&current_items, &session.name);
+                    let current_nodes = if wechat4_nodes.is_empty() {
+                        parse_message_nodes(automation, &current_items)
+                    } else {
+                        wechat4_nodes
+                    };
+                    current_nodes
+                        .into_iter()
+                        .filter(|node| node.incoming)
+                        .collect()
+                });
             messages.extend(messages_from_opened_session(
                 &runtime_id,
                 &session,
@@ -1576,20 +1620,43 @@ mod tests {
     }
 
     #[test]
-    fn retries_opened_chat_scan_until_message_nodes_are_available() {
+    fn retries_opened_chat_scan_until_the_expected_message_count_is_available() {
         let mut attempts = 0;
 
-        let nodes = retry_until_nonempty(4, Duration::ZERO, || {
+        let nodes = retry_until_minimum(4, Duration::ZERO, 3, || {
             attempts += 1;
             if attempts < 3 {
-                Vec::new()
-            } else {
                 vec!["message"]
+            } else {
+                vec!["message-1", "message-2", "message-3"]
             }
         });
 
-        assert_eq!(nodes, vec!["message"]);
+        assert_eq!(nodes.len(), 3);
         assert_eq!(attempts, 3);
+    }
+
+    #[test]
+    fn adds_a_partial_read_fallback_when_some_unread_messages_are_missing() {
+        let session = WeChatSession {
+            name: "张三".to_string(),
+            unread_count: 3,
+            preview: Some("最后一条".to_string()),
+        };
+        let messages = messages_from_opened_session(
+            "42-7",
+            &session,
+            &[UiMessageNode {
+                runtime_id: "message-1".to_string(),
+                sender: "张三".to_string(),
+                content: "第一条".to_string(),
+                incoming: true,
+            }],
+        );
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].content, "第一条");
+        assert_eq!(messages[1].unread_count, 2);
     }
 
     #[test]
@@ -1776,6 +1843,21 @@ mod tests {
 
         tracker.mark_delivered(&unread.id);
         assert!(tracker.ingest(Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn tracker_can_resume_pending_messages_after_monitor_restart() {
+        let pending = WeChatMessage {
+            id: "wechat-session-1-1-preview".to_string(),
+            sender: "Alice".to_string(),
+            preview: String::new(),
+            content: "preview".to_string(),
+            timestamp: 2,
+            unread_count: 1,
+        };
+        let mut tracker = MessageTracker::with_pending(vec![pending.clone()]);
+
+        assert_eq!(tracker.ingest(Vec::new()), vec![pending]);
     }
 
     #[test]

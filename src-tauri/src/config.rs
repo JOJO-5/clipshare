@@ -133,6 +133,10 @@ impl AppConfig {
         Self::config_dir().join("logs")
     }
 
+    pub fn pending_wechat_path() -> PathBuf {
+        Self::config_dir().join("wechat-pending.json")
+    }
+
     pub fn load() -> Self {
         let path = Self::config_path();
         if path.exists() {
