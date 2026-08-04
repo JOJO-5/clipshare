@@ -12,16 +12,78 @@ use std::time::{Duration, SystemTime};
 use tauri::{command, Emitter, Manager, State};
 
 fn load_pending_wechat_messages() -> Vec<WeChatMessage> {
-    std::fs::read_to_string(AppConfig::pending_wechat_path())
-        .ok()
-        .and_then(|content| serde_json::from_str(&content).ok())
-        .unwrap_or_default()
+    let paths = [
+        AppConfig::pending_wechat_path(),
+        pending_wechat_backup_path(),
+    ];
+    let mut last_error = None;
+    for path in paths {
+        match std::fs::read_to_string(&path) {
+            Ok(content) => match serde_json::from_str(&content) {
+                Ok(messages) => return messages,
+                Err(error) => {
+                    last_error = Some(format!("{}: {error}", path.display()));
+                }
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                last_error = Some(format!("{}: {error}", path.display()));
+            }
+        }
+    }
+    if let Some(error) = last_error {
+        log_pending_load_error(&error);
+    }
+    Vec::new()
 }
 
 fn save_pending_wechat_messages(messages: &[WeChatMessage]) -> Result<(), String> {
     std::fs::create_dir_all(AppConfig::config_dir()).map_err(|error| error.to_string())?;
     let content = serde_json::to_string_pretty(messages).map_err(|error| error.to_string())?;
-    std::fs::write(AppConfig::pending_wechat_path(), content).map_err(|error| error.to_string())
+    let target = AppConfig::pending_wechat_path();
+    let temp = pending_wechat_temp_path();
+    let backup = pending_wechat_backup_path();
+    std::fs::write(&temp, content).map_err(|error| error.to_string())?;
+
+    if target.exists() {
+        if backup.exists() {
+            let _ = std::fs::remove_file(&backup);
+        }
+        if let Err(error) = std::fs::rename(&target, &backup) {
+            let _ = std::fs::remove_file(&temp);
+            return Err(error.to_string());
+        }
+    }
+
+    if let Err(error) = std::fs::rename(&temp, &target) {
+        if backup.exists() {
+            let _ = std::fs::rename(&backup, &target);
+        }
+        let _ = std::fs::remove_file(&temp);
+        return Err(error.to_string());
+    }
+    if backup.exists() {
+        let _ = std::fs::remove_file(backup);
+    }
+    Ok(())
+}
+
+fn pending_wechat_temp_path() -> PathBuf {
+    AppConfig::pending_wechat_path().with_extension("json.tmp")
+}
+
+fn pending_wechat_backup_path() -> PathBuf {
+    AppConfig::pending_wechat_path().with_extension("json.bak")
+}
+
+fn log_pending_load_error(error: &str) {
+    let entry = LogEntry::error(&format!("wechat-pending-load failed error={error}"));
+    entry.write_to_file().ok();
+}
+
+fn log_pending_save_error(error: &str) {
+    let entry = LogEntry::error(&format!("wechat-pending-save failed error={error}"));
+    entry.write_to_file().ok();
 }
 
 pub struct AppState {
@@ -409,7 +471,9 @@ fn start_wechat_monitor_with_config(
                 .emit("wechat-monitor-log", &entry);
         },
         move |pending| {
-            let _ = save_pending_wechat_messages(&pending);
+            if let Err(error) = save_pending_wechat_messages(&pending) {
+                log_pending_save_error(&error);
+            }
         },
     )?;
 

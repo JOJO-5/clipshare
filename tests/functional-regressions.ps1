@@ -44,6 +44,12 @@ if ($commands -notmatch 'set_wechat_monitor_enabled') {
 if ($commands -notmatch 'wechat-send status=failed') {
     throw 'Failed WeChat notification delivery must be visible in diagnostics.'
 }
+if ($commands -notmatch 'pending_wechat_temp_path' -or $commands -notmatch 'pending_wechat_backup_path') {
+    throw 'Pending WeChat notifications must use temporary and backup files for crash-safe persistence.'
+}
+if ($commands -notmatch 'wechat-pending-save failed' -or $commands -notmatch 'wechat-pending-load failed') {
+    throw 'Pending WeChat persistence failures must be logged.'
+}
 if ($workflow -match 'cargo install tauri-cli') {
     throw 'CI must use the npm-installed Tauri CLI instead of compiling tauri-cli with Cargo.'
 }
