@@ -381,10 +381,23 @@ fn messages_from_opened_session(
     selected
 }
 
+fn unread_delivery_key(message: &WeChatMessage) -> Option<String> {
+    if message.id.starts_with("wechat-unread-") || message.id.starts_with("wechat-session-") {
+        return Some(format!(
+            "{}\u{1f}{}\u{1f}{}",
+            message.sender.trim(),
+            message.content.trim(),
+            message.unread_count
+        ));
+    }
+    None
+}
+
 #[derive(Debug, Default)]
 pub struct MessageTracker {
     initialized: bool,
     delivered_ids: HashSet<String>,
+    delivered_unread_keys: HashSet<String>,
     pending_messages: Vec<WeChatMessage>,
 }
 
@@ -393,6 +406,7 @@ impl MessageTracker {
         Self {
             initialized: true,
             delivered_ids: HashSet::new(),
+            delivered_unread_keys: HashSet::new(),
             pending_messages,
         }
     }
@@ -402,11 +416,13 @@ impl MessageTracker {
             .iter()
             .map(|message| message.id.clone())
             .collect::<HashSet<_>>();
+        let current_unread_keys = messages
+            .iter()
+            .filter_map(unread_delivery_key)
+            .collect::<HashSet<_>>();
         if !self.initialized {
             for message in messages {
-                if message.id.starts_with("wechat-unread-")
-                    || message.id.starts_with("wechat-session-")
-                {
+                if unread_delivery_key(&message).is_some() {
                     self.pending_messages.push(message);
                 } else {
                     self.delivered_ids.insert(message.id);
@@ -416,13 +432,20 @@ impl MessageTracker {
         } else {
             self.delivered_ids
                 .retain(|message_id| current_ids.contains(message_id));
+            self.delivered_unread_keys
+                .retain(|key| current_unread_keys.contains(key));
 
             for message in messages {
+                let unread_key = unread_delivery_key(&message);
                 if !self.delivered_ids.contains(&message.id)
-                    && !self
-                        .pending_messages
-                        .iter()
-                        .any(|pending| pending.id == message.id)
+                    && !unread_key
+                        .as_ref()
+                        .map(|key| self.delivered_unread_keys.contains(key))
+                        .unwrap_or(false)
+                    && !self.pending_messages.iter().any(|pending| {
+                        pending.id == message.id
+                            || unread_key.as_ref() == unread_delivery_key(pending).as_ref()
+                    })
                 {
                     self.pending_messages.push(message);
                 }
@@ -433,8 +456,16 @@ impl MessageTracker {
     }
 
     pub fn mark_delivered(&mut self, id: &str) {
+        let unread_key = self
+            .pending_messages
+            .iter()
+            .find(|message| message.id == id)
+            .and_then(unread_delivery_key);
         self.pending_messages.retain(|message| message.id != id);
         self.delivered_ids.insert(id.to_string());
+        if let Some(unread_key) = unread_key {
+            self.delivered_unread_keys.insert(unread_key);
+        }
     }
 
     pub fn pending_messages(&self) -> Vec<WeChatMessage> {
@@ -539,6 +570,10 @@ fn activate_unread_session(
     item: &uiautomation::UIElement,
     window: &uiautomation::UIElement,
 ) -> Option<SessionActivationMethod> {
+    if can_use_mouse_fallback(window) && item.click().is_ok() {
+        return Some(SessionActivationMethod::Mouse);
+    }
+
     if let Ok(invoke) = item.get_pattern::<UIInvokePattern>() {
         if invoke.invoke().is_ok() {
             return Some(SessionActivationMethod::Invoke);
@@ -549,10 +584,6 @@ fn activate_unread_session(
         if selection.select().is_ok() {
             return Some(SessionActivationMethod::Select);
         }
-    }
-
-    if can_use_mouse_fallback(window) && item.click().is_ok() {
-        return Some(SessionActivationMethod::Mouse);
     }
 
     None
@@ -2007,6 +2038,29 @@ mod tests {
         let pending = tracker.ingest(vec![duplicate.clone(), duplicate]);
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].id, "wechat-ui-duplicate");
+    }
+
+    #[test]
+    fn tracker_deduplicates_unread_content_when_ui_runtime_id_changes() {
+        let first = WeChatMessage {
+            id: "wechat-unread-session-a-wechat-ui-node-a".to_string(),
+            sender: "Alice".to_string(),
+            preview: String::new(),
+            content: "same unread content".to_string(),
+            timestamp: 1,
+            unread_count: 1,
+        };
+        let second = WeChatMessage {
+            id: "wechat-unread-session-b-wechat-ui-node-b".to_string(),
+            timestamp: 2,
+            ..first.clone()
+        };
+        let mut tracker = MessageTracker::default();
+
+        assert_eq!(tracker.ingest(vec![first.clone()]), vec![first.clone()]);
+        tracker.mark_delivered(&first.id);
+
+        assert!(tracker.ingest(vec![second]).is_empty());
     }
 
     #[test]

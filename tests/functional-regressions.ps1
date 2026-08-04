@@ -47,6 +47,11 @@ if ($wechatMonitor -notmatch 'SESSION_CLICK_RETRY_INTERVAL') {
 if ($wechatMonitor -notmatch 'should_retry_mouse_after_activation') {
     throw 'UIA activation must be verified and retried with the foreground mouse fallback when no message nodes appear.'
 }
+$mouseActivation = $wechatMonitor.IndexOf('can_use_mouse_fallback(window) && item.click().is_ok()')
+$uiaActivation = $wechatMonitor.IndexOf('get_pattern::<UIInvokePattern>()')
+if ($mouseActivation -lt 0 -or $uiaActivation -lt 0 -or $mouseActivation -gt $uiaActivation) {
+    throw 'Foreground WeChat sessions must prefer the original physical click before UIA activation.'
+}
 if ($wechatMonitor -notmatch 'monitor_thread\.join\(\)') {
     throw 'Stopping WeChat monitoring must wait for its worker thread to exit.'
 }
@@ -67,6 +72,10 @@ if ($commands -notmatch 'max_by_key') {
 }
 if ($commands -notmatch 'wechat-pending-save failed' -or $commands -notmatch 'wechat-pending-load failed') {
     throw 'Pending WeChat persistence failures must be logged.'
+}
+$app = Get-Content -LiteralPath (Join-Path $repoRoot 'src\App.tsx') -Raw
+if ($app -notmatch 'wechatNotificationKeys') {
+    throw 'WeChat notifications must suppress duplicate native toasts.'
 }
 if ($workflow -match 'cargo install tauri-cli') {
     throw 'CI must use the npm-installed Tauri CLI instead of compiling tauri-cli with Cargo.'

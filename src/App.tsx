@@ -17,9 +17,17 @@ interface WeChatMessage {
 }
 
 const { Title } = Typography
+const WECHAT_NOTIFICATION_DEDUP_WINDOW_MS = 30_000
 
 function truncatePreview(content: string, limit = 40) {
   return content.length <= limit ? content : `${Array.from(content).slice(0, limit).join('')}…`
+}
+
+function wechatNotificationKey(message: WeChatMessage) {
+  if (message.id.startsWith('wechat-unread-') || message.id.startsWith('wechat-session-')) {
+    return `${message.sender}\u0000${message.content}\u0000${message.unread_count}`
+  }
+  return message.id
 }
 
 function App() {
@@ -28,6 +36,7 @@ function App() {
   const [selectedWeChat, setSelectedWeChat] = useState<WeChatMessage | null>(null)
   const [notificationApi, notificationContextHolder] = notification.useNotification()
   const wechatMessages = useRef(new Map<string, WeChatMessage>())
+  const wechatNotificationKeys = useRef(new Map<string, number>())
 
   useEffect(() => {
     invoke('start_clipboard_monitor').catch(console.error)
@@ -72,6 +81,19 @@ function App() {
         }),
         listen<WeChatMessage>('wechat-received', event => {
           wechatMessages.current.set(event.payload.id, event.payload)
+          const notificationKey = wechatNotificationKey(event.payload)
+          const now = Date.now()
+          for (const [key, timestamp] of wechatNotificationKeys.current) {
+            if (now - timestamp >= WECHAT_NOTIFICATION_DEDUP_WINDOW_MS) {
+              wechatNotificationKeys.current.delete(key)
+            }
+          }
+          const previousNotification = wechatNotificationKeys.current.get(notificationKey)
+          const isDuplicate = previousNotification !== undefined
+            && now - previousNotification < WECHAT_NOTIFICATION_DEDUP_WINDOW_MS
+          wechatNotificationKeys.current.set(notificationKey, now)
+          if (isDuplicate) return
+
           const preview = truncatePreview(event.payload.preview || event.payload.content)
           appendLog({
             time: new Date().toISOString(),
@@ -81,7 +103,7 @@ function App() {
             size: event.payload.content.length,
           })
           notificationApi.open({
-            key: event.payload.id,
+            key: notificationKey,
             message: `微信消息 · ${event.payload.sender}`,
             description: preview,
             placement: 'bottomRight',
