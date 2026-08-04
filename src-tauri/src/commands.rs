@@ -17,11 +17,17 @@ fn load_pending_wechat_messages() -> Vec<WeChatMessage> {
         pending_wechat_backup_path(),
         pending_wechat_temp_path(),
     ];
+    let mut candidates = Vec::new();
     let mut last_error = None;
-    for path in paths {
+    for (priority, path) in paths.into_iter().enumerate() {
         match std::fs::read_to_string(&path) {
             Ok(content) => match serde_json::from_str(&content) {
-                Ok(messages) => return messages,
+                Ok(messages) => {
+                    let modified = std::fs::metadata(&path)
+                        .and_then(|metadata| metadata.modified())
+                        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                    candidates.push((modified, priority, messages));
+                }
                 Err(error) => {
                     last_error = Some(format!("{}: {error}", path.display()));
                 }
@@ -31,6 +37,12 @@ fn load_pending_wechat_messages() -> Vec<WeChatMessage> {
                 last_error = Some(format!("{}: {error}", path.display()));
             }
         }
+    }
+    if let Some((_, _, messages)) = candidates
+        .into_iter()
+        .max_by_key(|(modified, priority, _)| (*modified, *priority))
+    {
+        return messages;
     }
     if let Some(error) = last_error {
         log_pending_load_error(&error);

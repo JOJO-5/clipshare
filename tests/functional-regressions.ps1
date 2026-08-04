@@ -50,6 +50,9 @@ if ($commands -notmatch 'pending_wechat_temp_path' -or $commands -notmatch 'pend
 if ($commands -notmatch 'pending_wechat_path\(\),\s*pending_wechat_backup_path\(\),\s*pending_wechat_temp_path') {
     throw 'Pending WeChat startup recovery must inspect the temporary file as well as the target and backup.'
 }
+if ($commands -notmatch 'max_by_key') {
+    throw 'Pending WeChat startup recovery must choose the newest valid queue candidate.'
+}
 if ($commands -notmatch 'wechat-pending-save failed' -or $commands -notmatch 'wechat-pending-load failed') {
     throw 'Pending WeChat persistence failures must be logged.'
 }
