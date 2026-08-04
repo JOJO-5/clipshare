@@ -176,17 +176,67 @@ jobs:
         with:
           path: artifacts
 
+      - name: Prepare release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf release-assets
+          mkdir -p release-assets
+
+          copy_asset() {
+            local root="$1"
+            local file="$2"
+            local base artifact destination
+            base="$(basename "$file")"
+            artifact="$(basename "$root")"
+            case "$base" in
+              clipshare.exe) destination="ClipShare-${artifact}.exe" ;;
+              clipshare) destination="ClipShare-${artifact}" ;;
+              *) destination="$base" ;;
+            esac
+            if [[ -e "release-assets/$destination" ]]; then
+              destination="${artifact}-${base}"
+            fi
+            if [[ -e "release-assets/$destination" ]]; then
+              echo "Duplicate release asset: $destination" >&2
+              exit 1
+            fi
+            cp "$file" "release-assets/$destination"
+          }
+
+          while IFS= read -r -d '' root; do
+            while IFS= read -r -d '' file; do
+              copy_asset "$root" "$file"
+            done < <(
+              find "$root" -type f \( \
+                -iname '*.exe' -o \
+                -iname '*.msi' -o \
+                -iname '*.dmg' -o \
+                -iname '*.app.tar.gz' -o \
+                -iname '*.deb' -o \
+                -iname '*.appimage' \
+              \) ! -path '*/release/clipshare.exe' -print0
+            )
+            while IFS= read -r -d '' file; do
+              copy_asset "$root" "$file"
+            done < <(
+              find "$root" -type f \( \
+                -path '*/release/clipshare.exe' -o \
+                -path '*/release/clipshare' \
+              \) -print0
+            )
+          done < <(find artifacts -mindepth 1 -maxdepth 1 -type d -print0)
+
+          if [[ -z "$(find release-assets -maxdepth 1 -type f -print -quit)" ]]; then
+            echo 'No release assets were prepared.' >&2
+            exit 1
+          fi
+          find release-assets -maxdepth 1 -type f -printf '%f\n' | sort
+
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
-          files: |
-            artifacts/**/*.exe
-            artifacts/**/*.msi
-            artifacts/**/*.dmg
-            artifacts/**/*.app.tar.gz
-            artifacts/**/*.deb
-            artifacts/**/*.AppImage
-            artifacts/**/clipshare
-          draft: true
+          files: release-assets/*
+          draft: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
