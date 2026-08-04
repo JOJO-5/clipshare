@@ -47,6 +47,9 @@ if ($commands -notmatch 'wechat-send status=failed') {
 if ($commands -notmatch 'pending_wechat_temp_path' -or $commands -notmatch 'pending_wechat_backup_path') {
     throw 'Pending WeChat notifications must use temporary and backup files for crash-safe persistence.'
 }
+if ($commands -notmatch 'pending_wechat_path\(\),\s*pending_wechat_backup_path\(\),\s*pending_wechat_temp_path') {
+    throw 'Pending WeChat startup recovery must inspect the temporary file as well as the target and backup.'
+}
 if ($commands -notmatch 'wechat-pending-save failed' -or $commands -notmatch 'wechat-pending-load failed') {
     throw 'Pending WeChat persistence failures must be logged.'
 }

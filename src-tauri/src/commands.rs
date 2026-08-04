@@ -15,6 +15,7 @@ fn load_pending_wechat_messages() -> Vec<WeChatMessage> {
     let paths = [
         AppConfig::pending_wechat_path(),
         pending_wechat_backup_path(),
+        pending_wechat_temp_path(),
     ];
     let mut last_error = None;
     for path in paths {
