@@ -1,5 +1,5 @@
 use crate::autostart::set_autostart;
-use crate::clipboard::ClipboardListener;
+use crate::clipboard::{ClipboardContent, ClipboardListener, ClipboardSuppression};
 use crate::config::{AppConfig, StartupConnection};
 use crate::logger::LogEntry;
 use crate::network::ConnectionStatus;
@@ -103,6 +103,7 @@ pub struct AppState {
     pub network: Arc<Mutex<NetworkManager>>,
     pub logs: Arc<Mutex<Vec<LogEntry>>>,
     pub clipboard_listener: Mutex<Option<ClipboardListener>>,
+    pub clipboard_suppression: Arc<ClipboardSuppression>,
     pub wechat_monitor: Mutex<Option<WeChatMonitor>>,
     pub wechat_tracker: Arc<Mutex<MessageTracker>>,
 }
@@ -113,6 +114,7 @@ impl Default for AppState {
             network: Arc::new(Mutex::new(NetworkManager::new())),
             logs: Arc::new(Mutex::new(Vec::new())),
             clipboard_listener: Mutex::new(None),
+            clipboard_suppression: Arc::new(ClipboardSuppression::new()),
             wechat_monitor: Mutex::new(None),
             wechat_tracker: Arc::new(Mutex::new(MessageTracker::with_pending(
                 load_pending_wechat_messages(),
@@ -188,35 +190,46 @@ fn start_server_with_state(
     let network = state.network.lock().unwrap();
     let logs = Arc::clone(&state.logs);
     let receive_app_handle = app_handle.clone();
+    let clipboard_suppression = Arc::clone(&state.clipboard_suppression);
     install_network_status_logger(&network, Arc::clone(&state.logs), app_handle);
 
     network.start_server(port, move |data, msg_type| {
         let (data_type, content, size) = match msg_type {
             TYPE_TEXT => {
                 let text = String::from_utf8_lossy(&data).to_string();
-                let _ = crate::clipboard::set_text(&text);
+                let content = ClipboardContent::Text(text.clone());
+                apply_received_clipboard(&clipboard_suppression, &content, || {
+                    crate::clipboard::set_text(&text)
+                })?;
                 ("text", text, data.len() as u64)
             }
             TYPE_IMAGE => match decode_image(&data) {
                 Ok((width, height, bytes)) => {
-                    let _ = crate::clipboard::set_image(width, height, bytes);
+                    let content = ClipboardContent::Image {
+                        width,
+                        height,
+                        bytes: bytes.clone(),
+                    };
+                    apply_received_clipboard(&clipboard_suppression, &content, || {
+                        crate::clipboard::set_image(width, height, bytes)
+                    })?;
                     ("image", "图片".to_string(), data.len() as u64)
                 }
-                Err(error) => ("error", error, 0),
+                Err(error) => return Err(error),
             },
-            TYPE_FILE => match save_received_file(&data) {
+            TYPE_FILE => match save_received_file(&data, &clipboard_suppression) {
                 Ok(path) => (
                     "file",
                     format!("已保存: {}", path.display()),
                     data.len() as u64,
                 ),
-                Err(error) => ("error", error, 0),
+                Err(error) => return Err(error),
             },
             TYPE_WECHAT => match decode_wechat(&data) {
                 Ok(message) => ("wechat", message.preview, data.len() as u64),
-                Err(error) => ("error", error, 0),
+                Err(error) => return Err(error),
             },
-            _ => ("", "未知".to_string(), 0),
+            _ => return Err(format!("Unsupported message type: {msg_type}")),
         };
 
         let entry = LogEntry::recv(data_type, &content, size);
@@ -228,6 +241,7 @@ fn start_server_with_state(
                 let _ = receive_app_handle.emit("wechat-received", &message);
             }
         }
+        Ok(())
     })
 }
 
@@ -254,35 +268,46 @@ fn connect_to_server_with_state(
     let network = state.network.lock().unwrap();
     let logs = Arc::clone(&state.logs);
     let receive_app_handle = app_handle.clone();
+    let clipboard_suppression = Arc::clone(&state.clipboard_suppression);
     install_network_status_logger(&network, Arc::clone(&state.logs), app_handle);
 
     network.connect_to_server(ip, port, move |data, msg_type| {
         let (data_type, content, size) = match msg_type {
             TYPE_TEXT => {
                 let text = String::from_utf8_lossy(&data).to_string();
-                let _ = crate::clipboard::set_text(&text);
+                let content = ClipboardContent::Text(text.clone());
+                apply_received_clipboard(&clipboard_suppression, &content, || {
+                    crate::clipboard::set_text(&text)
+                })?;
                 ("text", text, data.len() as u64)
             }
             TYPE_IMAGE => match decode_image(&data) {
                 Ok((width, height, bytes)) => {
-                    let _ = crate::clipboard::set_image(width, height, bytes);
+                    let content = ClipboardContent::Image {
+                        width,
+                        height,
+                        bytes: bytes.clone(),
+                    };
+                    apply_received_clipboard(&clipboard_suppression, &content, || {
+                        crate::clipboard::set_image(width, height, bytes)
+                    })?;
                     ("image", "图片".to_string(), data.len() as u64)
                 }
-                Err(error) => ("error", error, 0),
+                Err(error) => return Err(error),
             },
-            TYPE_FILE => match save_received_file(&data) {
+            TYPE_FILE => match save_received_file(&data, &clipboard_suppression) {
                 Ok(path) => (
                     "file",
                     format!("已保存: {}", path.display()),
                     data.len() as u64,
                 ),
-                Err(error) => ("error", error, 0),
+                Err(error) => return Err(error),
             },
             TYPE_WECHAT => match decode_wechat(&data) {
                 Ok(message) => ("wechat", message.preview, data.len() as u64),
-                Err(error) => ("error", error, 0),
+                Err(error) => return Err(error),
             },
-            _ => ("", "未知".to_string(), 0),
+            _ => return Err(format!("Unsupported message type: {msg_type}")),
         };
 
         let entry = LogEntry::recv(data_type, &content, size);
@@ -294,6 +319,7 @@ fn connect_to_server_with_state(
                 let _ = receive_app_handle.emit("wechat-received", &message);
             }
         }
+        Ok(())
     })
 }
 
@@ -554,10 +580,12 @@ pub fn start_clipboard_monitor(
     let logs = Arc::clone(&state.logs);
     let diagnostic_logs = Arc::clone(&state.logs);
     let network: Arc<Mutex<NetworkManager>> = Arc::clone(&state.network);
+    let clipboard_suppression = Arc::clone(&state.clipboard_suppression);
     let window_clone = window.clone();
     let diagnostic_window = window.clone();
 
     listener.start(
+        (*clipboard_suppression).clone(),
         move |content| {
             let data_type = content.data_type();
             let summary = content.summary();
@@ -620,7 +648,26 @@ fn send_clipboard_content(
     }
 }
 
-fn save_received_file(payload: &[u8]) -> Result<std::path::PathBuf, String> {
+fn apply_received_clipboard<F>(
+    suppression: &ClipboardSuppression,
+    content: &ClipboardContent,
+    apply: F,
+) -> Result<(), String>
+where
+    F: FnOnce() -> Result<(), String>,
+{
+    suppression.record(content);
+    if let Err(error) = apply() {
+        suppression.forget(content);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn save_received_file(
+    payload: &[u8],
+    suppression: &ClipboardSuppression,
+) -> Result<std::path::PathBuf, String> {
     let (filename, contents) = decode_file(payload)?;
     let directory = dirs::download_dir()
         .unwrap_or_else(|| AppConfig::config_dir().join("downloads"))
@@ -628,7 +675,11 @@ fn save_received_file(payload: &[u8]) -> Result<std::path::PathBuf, String> {
     std::fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
     let target = directory.join(filename);
     std::fs::write(&target, contents).map_err(|error| error.to_string())?;
-    crate::clipboard::set_files(&[target.to_string_lossy().into_owned()])?;
+    let target_string = target.to_string_lossy().into_owned();
+    let clipboard_content = ClipboardContent::Files(vec![target_string.clone()]);
+    apply_received_clipboard(suppression, &clipboard_content, || {
+        crate::clipboard::set_files(&[target_string])
+    })?;
     cleanup_received_files(&directory, &target);
     Ok(target)
 }

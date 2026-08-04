@@ -1,3 +1,6 @@
+use std::collections::{hash_map::DefaultHasher, VecDeque};
+use std::hash::{Hash, Hasher};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone)]
@@ -9,6 +12,60 @@ pub enum ClipboardContent {
         bytes: Vec<u8>,
     },
     Files(Vec<String>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct ClipboardFingerprint {
+    kind: u8,
+    digest: u64,
+}
+
+const REMOTE_SUPPRESSION_TTL: Duration = Duration::from_secs(3);
+
+#[derive(Clone, Default)]
+pub struct ClipboardSuppression {
+    recent: Arc<Mutex<VecDeque<(ClipboardFingerprint, Instant)>>>,
+}
+
+impl ClipboardSuppression {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn record(&self, content: &ClipboardContent) {
+        let now = Instant::now();
+        if let Ok(mut recent) = self.recent.lock() {
+            recent.retain(|(_, recorded_at)| {
+                now.duration_since(*recorded_at) < REMOTE_SUPPRESSION_TTL
+            });
+            recent.push_back((content.fingerprint(), now));
+        }
+    }
+
+    pub fn forget(&self, content: &ClipboardContent) {
+        let fingerprint = content.fingerprint();
+        if let Ok(mut recent) = self.recent.lock() {
+            recent.retain(|(recorded, _)| *recorded != fingerprint);
+        }
+    }
+
+    fn consume_if_suppressed(&self, content: &ClipboardContent) -> bool {
+        let fingerprint = content.fingerprint();
+        let now = Instant::now();
+        let Ok(mut recent) = self.recent.lock() else {
+            return false;
+        };
+        recent.retain(|(_, recorded_at)| now.duration_since(*recorded_at) < REMOTE_SUPPRESSION_TTL);
+        if let Some(index) = recent
+            .iter()
+            .position(|(recorded, _)| *recorded == fingerprint)
+        {
+            recent.remove(index);
+            true
+        } else {
+            false
+        }
+    }
 }
 
 fn should_retry_observation(
@@ -25,6 +82,39 @@ fn should_emit_health_log(elapsed: Duration) -> bool {
 }
 
 impl ClipboardContent {
+    fn fingerprint(&self) -> ClipboardFingerprint {
+        let mut hasher = DefaultHasher::new();
+        match self {
+            ClipboardContent::Text(text) => {
+                text.hash(&mut hasher);
+                ClipboardFingerprint {
+                    kind: 1,
+                    digest: hasher.finish(),
+                }
+            }
+            ClipboardContent::Image {
+                width,
+                height,
+                bytes,
+            } => {
+                width.hash(&mut hasher);
+                height.hash(&mut hasher);
+                bytes.hash(&mut hasher);
+                ClipboardFingerprint {
+                    kind: 2,
+                    digest: hasher.finish(),
+                }
+            }
+            ClipboardContent::Files(paths) => {
+                paths.hash(&mut hasher);
+                ClipboardFingerprint {
+                    kind: 3,
+                    digest: hasher.finish(),
+                }
+            }
+        }
+    }
+
     pub fn data_type(&self) -> &'static str {
         match self {
             ClipboardContent::Text(_) => "text",
@@ -125,7 +215,7 @@ impl ClipboardListener {
         Self
     }
 
-    pub fn start<F, D>(&self, on_change: F, on_diagnostic: D)
+    pub fn start<F, D>(&self, suppression: ClipboardSuppression, on_change: F, on_diagnostic: D)
     where
         F: Fn(ClipboardContent) -> Result<(), String> + Send + 'static,
         D: Fn(String) + Send + 'static,
@@ -169,19 +259,29 @@ impl ClipboardListener {
                         attempted_text = text.clone();
                         last_text_attempt = Instant::now();
                         let content = ClipboardContent::Text(text.clone());
-                        on_diagnostic(format!(
-                            "clipboard-read type=text size={} summary={}",
-                            content.size(),
-                            content.summary()
-                        ));
-                        match on_change(content) {
-                            Ok(()) => {
-                                last_text = text;
-                                on_diagnostic("clipboard-send type=text status=sent".to_string());
+                        if suppression.consume_if_suppressed(&content) {
+                            last_text = text;
+                            on_diagnostic(
+                                "clipboard-read type=text origin=remote status=suppressed"
+                                    .to_string(),
+                            );
+                        } else {
+                            on_diagnostic(format!(
+                                "clipboard-read type=text size={} summary={}",
+                                content.size(),
+                                content.summary()
+                            ));
+                            match on_change(content) {
+                                Ok(()) => {
+                                    last_text = text;
+                                    on_diagnostic(
+                                        "clipboard-send type=text status=sent".to_string(),
+                                    );
+                                }
+                                Err(error) => on_diagnostic(format!(
+                                    "clipboard-send type=text status=failed error={error}"
+                                )),
                             }
-                            Err(error) => on_diagnostic(format!(
-                                "clipboard-send type=text status=failed error={error}"
-                            )),
                         }
                     }
                 }
@@ -195,19 +295,29 @@ impl ClipboardListener {
                         attempted_files = files.clone();
                         last_files_attempt = Instant::now();
                         let content = ClipboardContent::Files(files.clone());
-                        on_diagnostic(format!(
-                            "clipboard-read type=file size={} summary={}",
-                            content.size(),
-                            content.summary()
-                        ));
-                        match on_change(content) {
-                            Ok(()) => {
-                                last_files = files;
-                                on_diagnostic("clipboard-send type=file status=sent".to_string());
+                        if suppression.consume_if_suppressed(&content) {
+                            last_files = files;
+                            on_diagnostic(
+                                "clipboard-read type=file origin=remote status=suppressed"
+                                    .to_string(),
+                            );
+                        } else {
+                            on_diagnostic(format!(
+                                "clipboard-read type=file size={} summary={}",
+                                content.size(),
+                                content.summary()
+                            ));
+                            match on_change(content) {
+                                Ok(()) => {
+                                    last_files = files;
+                                    on_diagnostic(
+                                        "clipboard-send type=file status=sent".to_string(),
+                                    );
+                                }
+                                Err(error) => on_diagnostic(format!(
+                                    "clipboard-send type=file status=failed error={error}"
+                                )),
                             }
-                            Err(error) => on_diagnostic(format!(
-                                "clipboard-send type=file status=failed error={error}"
-                            )),
                         }
                     }
                 }
@@ -229,22 +339,30 @@ impl ClipboardListener {
                                 height,
                                 bytes: bytes.clone(),
                             };
-                            on_diagnostic(format!(
-                                "clipboard-read type=image width={} height={} size={}",
-                                width,
-                                height,
-                                content.size()
-                            ));
-                            match on_change(content) {
-                                Ok(()) => {
-                                    last_image = bytes;
-                                    on_diagnostic(
-                                        "clipboard-send type=image status=sent".to_string(),
-                                    );
+                            if suppression.consume_if_suppressed(&content) {
+                                last_image = bytes;
+                                on_diagnostic(
+                                    "clipboard-read type=image origin=remote status=suppressed"
+                                        .to_string(),
+                                );
+                            } else {
+                                on_diagnostic(format!(
+                                    "clipboard-read type=image width={} height={} size={}",
+                                    width,
+                                    height,
+                                    content.size()
+                                ));
+                                match on_change(content) {
+                                    Ok(()) => {
+                                        last_image = bytes;
+                                        on_diagnostic(
+                                            "clipboard-send type=image status=sent".to_string(),
+                                        );
+                                    }
+                                    Err(error) => on_diagnostic(format!(
+                                        "clipboard-send type=image status=failed error={error}"
+                                    )),
                                 }
-                                Err(error) => on_diagnostic(format!(
-                                    "clipboard-send type=image status=failed error={error}"
-                                )),
                             }
                         }
                     }
@@ -262,7 +380,7 @@ impl ClipboardListener {
     pub fn new() -> Self {
         Self
     }
-    pub fn start<F, D>(&self, _on_change: F, _on_diagnostic: D)
+    pub fn start<F, D>(&self, _suppression: ClipboardSuppression, _on_change: F, _on_diagnostic: D)
     where
         F: Fn(ClipboardContent) -> Result<(), String> + Send + 'static,
         D: Fn(String) + Send + 'static,
@@ -294,5 +412,25 @@ mod tests {
     fn clipboard_health_log_is_rate_limited() {
         assert!(!should_emit_health_log(Duration::from_secs(29)));
         assert!(should_emit_health_log(Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn remote_clipboard_content_is_suppressed_once_without_looping_back() {
+        let suppression = ClipboardSuppression::new();
+        let content = ClipboardContent::Text("received remotely".to_string());
+
+        suppression.record(&content);
+        assert!(suppression.consume_if_suppressed(&content));
+        assert!(!suppression.consume_if_suppressed(&content));
+    }
+
+    #[test]
+    fn failed_remote_clipboard_write_can_remove_suppression() {
+        let suppression = ClipboardSuppression::new();
+        let content = ClipboardContent::Files(vec!["C:\\received.txt".to_string()]);
+
+        suppression.record(&content);
+        suppression.forget(&content);
+        assert!(!suppression.consume_if_suppressed(&content));
     }
 }

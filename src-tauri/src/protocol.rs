@@ -7,6 +7,7 @@ pub const TYPE_FILE: u8 = 0x03;
 pub const TYPE_HEARTBEAT: u8 = 0x04;
 pub const TYPE_ACK: u8 = 0x05;
 pub const TYPE_WECHAT: u8 = 0x06;
+pub const TYPE_NACK: u8 = 0x07;
 pub const CHUNK_SIZE: usize = 65536;
 pub const HEADER_SIZE: usize = 12;
 pub const COMPRESSED: u8 = 0x01;
@@ -149,6 +150,11 @@ mod tests {
     #[test]
     fn wechat_message_type_is_reserved_for_notifications() {
         assert_eq!(TYPE_WECHAT, 0x06);
+    }
+
+    #[test]
+    fn nack_message_type_is_reserved_for_failed_processing() {
+        assert_eq!(TYPE_NACK, 0x07);
     }
 
     #[test]

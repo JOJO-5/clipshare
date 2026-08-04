@@ -30,6 +30,23 @@ function wechatNotificationKey(message: WeChatMessage) {
   return message.id
 }
 
+function wechatNotificationGroup(message: WeChatMessage) {
+  const sender = message.sender.trim().toLowerCase()
+  return `wechat-sender-${sender || 'unknown'}`
+}
+
+function combineWechatMessages(messages: WeChatMessage[]) {
+  const latest = messages[messages.length - 1]
+  if (!latest) throw new Error('Cannot combine an empty WeChat message group')
+  if (messages.length === 1) return latest
+  return {
+    ...latest,
+    content: messages
+      .map((message, index) => `[${index + 1}] ${message.content}`)
+      .join('\n\n'),
+  }
+}
+
 function App() {
   const [activeTab, setActiveTab] = useState('config')
   const [logs, setLogs] = useState<LogEntry[]>([])
@@ -37,6 +54,7 @@ function App() {
   const [notificationApi, notificationContextHolder] = notification.useNotification()
   const wechatMessages = useRef(new Map<string, WeChatMessage>())
   const wechatNotificationKeys = useRef(new Map<string, number>())
+  const wechatNotificationGroups = useRef(new Map<string, WeChatMessage[]>())
 
   useEffect(() => {
     invoke('start_clipboard_monitor').catch(console.error)
@@ -66,7 +84,13 @@ function App() {
           const messageId = action.extra?.messageId
           if (typeof messageId === 'string') {
             const message = wechatMessages.current.get(messageId)
-            if (message) setSelectedWeChat(message)
+            if (message) {
+              const groupKey = wechatNotificationGroup(message)
+              const groupedMessages = wechatNotificationGroups.current.get(groupKey) ?? [message]
+              wechatNotificationGroups.current.delete(groupKey)
+              notificationApi.destroy(groupKey)
+              setSelectedWeChat(combineWechatMessages(groupedMessages))
+            }
           }
         })
         stopNotificationAction = () => { void notificationActionListener.unregister() }
@@ -95,6 +119,17 @@ function App() {
           if (isDuplicate) return
 
           const preview = truncatePreview(event.payload.preview || event.payload.content)
+          const groupKey = wechatNotificationGroup(event.payload)
+          const hasPendingNotification = wechatNotificationGroups.current.has(groupKey)
+          const groupedMessages = [
+            ...(wechatNotificationGroups.current.get(groupKey) ?? []),
+            event.payload,
+          ].slice(-50)
+          const groupedCount = groupedMessages.length
+          wechatNotificationGroups.current.set(groupKey, groupedMessages)
+          const groupedDescription = groupedCount > 1
+            ? `${groupedCount} 条新消息\n${preview}`
+            : preview
           appendLog({
             time: new Date().toISOString(),
             type: 'recv',
@@ -103,18 +138,23 @@ function App() {
             size: event.payload.content.length,
           })
           notificationApi.open({
-            key: notificationKey,
+            key: groupKey,
             message: `微信消息 · ${event.payload.sender}`,
-            description: preview,
+            description: groupedDescription,
             placement: 'bottomRight',
             duration: 0,
-            onClick: () => setSelectedWeChat(event.payload),
+            onClick: () => {
+              const messages = wechatNotificationGroups.current.get(groupKey) ?? [event.payload]
+              wechatNotificationGroups.current.delete(groupKey)
+              notificationApi.destroy(groupKey)
+              setSelectedWeChat(combineWechatMessages(messages))
+            },
           })
-          if (permissionGranted) {
+          if (permissionGranted && !hasPendingNotification) {
             sendNotification({
-              id: Math.abs(hashMessageId(event.payload.id)),
+              id: Math.abs(hashMessageId(groupKey)),
               title: `微信消息 · ${event.payload.sender}`,
-              body: preview,
+              body: groupedDescription,
               extra: { messageId: event.payload.id },
               autoCancel: true,
             })

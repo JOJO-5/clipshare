@@ -4,6 +4,8 @@ $repoRoot = Split-Path -Parent $PSScriptRoot
 $configPanel = Get-Content -LiteralPath (Join-Path $repoRoot 'src\components\ConfigPanel.tsx') -Raw
 $commands = Get-Content -LiteralPath (Join-Path $repoRoot 'src-tauri\src\commands.rs') -Raw
 $clipboard = Get-Content -LiteralPath (Join-Path $repoRoot 'src-tauri\src\clipboard.rs') -Raw
+$network = Get-Content -LiteralPath (Join-Path $repoRoot 'src-tauri\src\network.rs') -Raw
+$protocol = Get-Content -LiteralPath (Join-Path $repoRoot 'src-tauri\src\protocol.rs') -Raw
 $wechatMonitor = Get-Content -LiteralPath (Join-Path $repoRoot 'src-tauri\src\wechat_monitor.rs') -Raw
 $workflow = Get-Content -LiteralPath (Join-Path $repoRoot '.github\workflows\build.yml') -Raw
 $packageJson = Get-Content -LiteralPath (Join-Path $repoRoot 'package.json') -Raw
@@ -16,6 +18,21 @@ if ($configPanel -notmatch 'getFieldsValue\(true\)') {
 }
 if ($commands -notmatch 'set_files\(' -or $clipboard -notmatch 'FileList[\s\S]*write_clipboard') {
     throw 'Received files must be written back as a Windows file-list clipboard payload.'
+}
+if ($network -notmatch 'send_with_ack\(TYPE_TEXT' -or $network -notmatch 'send_with_ack\(TYPE_IMAGE' -or $network -notmatch 'send_with_ack\(TYPE_FILE') {
+    throw 'Text, image, and file clipboard payloads must wait for a processing acknowledgement.'
+}
+if ($network -notmatch 'processed_sequences' -or $network -notmatch 'TYPE_NACK') {
+    throw 'Received payloads must be deduplicated by sequence and report processing failures.'
+}
+if ($commands -notmatch 'ClipboardSuppression' -or $commands -notmatch 'apply_received_clipboard') {
+    throw 'Remote clipboard writes must be marked to prevent echoing back to the sender.'
+}
+if ($clipboard -notmatch 'origin=remote status=suppressed') {
+    throw 'Clipboard monitoring must log and suppress remote-origin clipboard changes.'
+}
+if ($protocol -notmatch 'TYPE_NACK') {
+    throw 'The protocol must reserve a negative acknowledgement message type.'
 }
 if ($wechatMonitor -notmatch 'ChatWnd') {
     throw 'WeChat monitor must recognize top-level ChatWnd windows.'
@@ -81,6 +98,9 @@ if ($commands -notmatch 'wechat-pending-save failed' -or $commands -notmatch 'we
 $app = Get-Content -LiteralPath (Join-Path $repoRoot 'src\App.tsx') -Raw
 if ($app -notmatch 'wechatNotificationKeys') {
     throw 'WeChat notifications must suppress duplicate native toasts.'
+}
+if ($app -notmatch 'wechatNotificationGroups' -or $app -notmatch 'key: groupKey' -or $app -notmatch 'hasPendingNotification') {
+    throw 'WeChat notifications must collapse multiple messages from one sender.'
 }
 if ($app -match "message\.id\.startsWith\('wechat-unread-'\)") {
     throw 'Full unread messages must keep stable occurrence IDs instead of semantic deduplication.'

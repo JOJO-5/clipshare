@@ -26,6 +26,12 @@ struct UiScanSummary {
     sessions: usize,
     unread_sessions: usize,
     opened_sessions: usize,
+    activation_attempts: usize,
+    activation_invoke: usize,
+    activation_select: usize,
+    activation_mouse: usize,
+    activation_failures: usize,
+    mouse_retries: usize,
     lists: usize,
     items: usize,
     parsed_nodes: usize,
@@ -83,11 +89,17 @@ fn format_native_accessibility_diagnostic(snapshot: &NativeAccessibilitySnapshot
 impl UiScanSummary {
     fn format_log(&self) -> String {
         format!(
-            "wechat-ui windows={} sessions={} unread_sessions={} opened_sessions={} lists={} items={} parsed={} incoming={} text_nodes={} messages={}",
+            "wechat-ui windows={} sessions={} unread_sessions={} opened_sessions={} activation_attempts={} activation_invoke={} activation_select={} activation_mouse={} activation_failures={} mouse_retries={} lists={} items={} parsed={} incoming={} text_nodes={} messages={}",
             self.windows,
             self.sessions,
             self.unread_sessions,
             self.opened_sessions,
+            self.activation_attempts,
+            self.activation_invoke,
+            self.activation_select,
+            self.activation_mouse,
+            self.activation_failures,
+            self.mouse_retries,
             self.lists,
             self.items,
             self.parsed_nodes,
@@ -820,6 +832,12 @@ fn merge_scan_summary(target: &mut UiScanSummary, source: &UiScanSummary) {
     target.sessions += source.sessions;
     target.unread_sessions += source.unread_sessions;
     target.opened_sessions += source.opened_sessions;
+    target.activation_attempts += source.activation_attempts;
+    target.activation_invoke += source.activation_invoke;
+    target.activation_select += source.activation_select;
+    target.activation_mouse += source.activation_mouse;
+    target.activation_failures += source.activation_failures;
+    target.mouse_retries += source.mouse_retries;
     target.lists += source.lists;
     target.items += source.items;
     target.parsed_nodes += source.parsed_nodes;
@@ -1043,14 +1061,27 @@ fn scan_wechat_window(
         click_tracker.sync_unread_ids(&active_sessions);
         let mut messages = Vec::new();
         let mut opened_sessions = 0;
+        let mut activation_attempts = 0;
+        let mut activation_invoke = 0;
+        let mut activation_select = 0;
+        let mut activation_mouse = 0;
+        let mut activation_failures = 0;
+        let mut mouse_retries = 0;
         for (item, session) in unread_targets {
             let session_key = session_click_key(&session.name);
             if click_tracker.was_clicked(&session_key) {
                 continue;
             }
             click_tracker.mark_clicked(&session_key);
+            activation_attempts += 1;
             let initial_mouse_fallback_available = can_use_mouse_fallback(window);
             let activation_method = activate_unread_session(item, window);
+            match activation_method {
+                Some(SessionActivationMethod::Invoke) => activation_invoke += 1,
+                Some(SessionActivationMethod::Select) => activation_select += 1,
+                Some(SessionActivationMethod::Mouse) => activation_mouse += 1,
+                None => activation_failures += 1,
+            }
             if activation_method.is_none() {
                 messages.extend(message_from_unread_session(&session_key, &session));
                 continue;
@@ -1080,6 +1111,7 @@ fn scan_wechat_window(
                 initial_mouse_fallback_available,
                 activation_method == Some(SessionActivationMethod::Mouse),
             ) {
+                mouse_retries += 1;
                 if item.click().is_ok() {
                     current_nodes = retry_until_minimum(
                         6,
@@ -1120,6 +1152,12 @@ fn scan_wechat_window(
                 sessions: unread_sessions,
                 unread_sessions,
                 opened_sessions,
+                activation_attempts,
+                activation_invoke,
+                activation_select,
+                activation_mouse,
+                activation_failures,
+                mouse_retries,
                 lists: lists.len(),
                 items: items.len(),
                 parsed_nodes: nodes.len(),
@@ -1683,6 +1721,12 @@ mod tests {
             sessions: 4,
             unread_sessions: 2,
             opened_sessions: 1,
+            activation_attempts: 1,
+            activation_invoke: 1,
+            activation_select: 0,
+            activation_mouse: 0,
+            activation_failures: 0,
+            mouse_retries: 0,
             lists: 2,
             items: 8,
             parsed_nodes: 6,
@@ -1694,7 +1738,7 @@ mod tests {
 
         assert_eq!(
             summary.format_log(),
-            "wechat-ui windows=1 sessions=4 unread_sessions=2 opened_sessions=1 lists=2 items=8 parsed=6 incoming=3 text_nodes=0 messages=3"
+            "wechat-ui windows=1 sessions=4 unread_sessions=2 opened_sessions=1 activation_attempts=1 activation_invoke=1 activation_select=0 activation_mouse=0 activation_failures=0 mouse_retries=0 lists=2 items=8 parsed=6 incoming=3 text_nodes=0 messages=3"
         );
     }
 
@@ -1904,6 +1948,12 @@ mod tests {
             sessions: 0,
             unread_sessions: 0,
             opened_sessions: 0,
+            activation_attempts: 0,
+            activation_invoke: 0,
+            activation_select: 0,
+            activation_mouse: 0,
+            activation_failures: 0,
+            mouse_retries: 0,
             lists: 0,
             items: 0,
             parsed_nodes: 0,
@@ -1917,6 +1967,12 @@ mod tests {
             sessions: 0,
             unread_sessions: 0,
             opened_sessions: 0,
+            activation_attempts: 0,
+            activation_invoke: 0,
+            activation_select: 0,
+            activation_mouse: 0,
+            activation_failures: 0,
+            mouse_retries: 0,
             lists: 1,
             items: 4,
             parsed_nodes: 4,

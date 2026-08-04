@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream, ToSocketAddrs};
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -37,9 +37,25 @@ pub enum ConnectionStatus {
     Connected,
 }
 
-type ReceiveHandler = Arc<dyn Fn(Vec<u8>, u8) + Send + Sync + 'static>;
+type ReceiveHandler = Arc<dyn Fn(Vec<u8>, u8) -> Result<(), String> + Send + Sync + 'static>;
 type StatusHandler = Arc<dyn Fn(ConnectionStatus, &str) + Send + Sync + 'static>;
-type AckWaiter = Arc<(Mutex<bool>, Condvar)>;
+type AckWaiter = Arc<(Mutex<Option<bool>>, Condvar)>;
+
+pub trait ReceiveOutcome {
+    fn into_receive_result(self) -> Result<(), String>;
+}
+
+impl ReceiveOutcome for () {
+    fn into_receive_result(self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+impl ReceiveOutcome for Result<(), String> {
+    fn into_receive_result(self) -> Result<(), String> {
+        self
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 enum ConnectionEnd {
@@ -184,7 +200,7 @@ impl NetworkManager {
         for waiter in waiters {
             let (completed, wake) = &*waiter;
             if let Ok(mut completed) = completed.lock() {
-                *completed = false;
+                *completed = Some(false);
                 wake.notify_all();
             }
         }
@@ -203,8 +219,11 @@ impl NetworkManager {
         session: Arc<AtomicU64>,
         session_id: u64,
         on_receive: ReceiveHandler,
+        sender: Arc<Mutex<Option<TcpStream>>>,
         ack_waiters: Arc<Mutex<HashMap<u16, AckWaiter>>>,
     ) -> ConnectionEnd {
+        let mut processed_sequences = HashSet::new();
+        let mut processed_sequence_order = VecDeque::new();
         loop {
             if session.load(Ordering::SeqCst) != session_id {
                 return ConnectionEnd::Stopped;
@@ -221,12 +240,13 @@ impl NetworkManager {
                     if h.msg_type == TYPE_HEARTBEAT {
                         continue;
                     }
-                    if h.msg_type == TYPE_ACK {
+                    if h.msg_type == TYPE_ACK || h.msg_type == TYPE_NACK {
+                        let acknowledged = h.msg_type == TYPE_ACK;
                         if let Ok(mut waiters) = ack_waiters.lock() {
                             if let Some(waiter) = waiters.remove(&h.sequence) {
                                 let (completed, wake) = &*waiter;
                                 if let Ok(mut completed) = completed.lock() {
-                                    *completed = true;
+                                    *completed = Some(acknowledged);
                                     wake.notify_all();
                                 }
                             }
@@ -240,14 +260,58 @@ impl NetworkManager {
                     if let Err(error) = receiver.read_exact(&mut data) {
                         return Self::connection_end_from_io(&error);
                     }
-                    if catch_unwind(AssertUnwindSafe(|| on_receive(data, h.msg_type))).is_err() {
-                        return ConnectionEnd::ReceiveHandlerPanicked;
+
+                    if h.sequence != 0 && processed_sequences.contains(&h.sequence) {
+                        if Self::write_sender_control_frame(&sender, TYPE_ACK, h.sequence).is_err()
+                        {
+                            return ConnectionEnd::PeerClosed;
+                        }
+                        continue;
                     }
-                    if Self::write_control_frame(&mut receiver, TYPE_ACK, h.sequence).is_err() {
-                        return ConnectionEnd::PeerClosed;
+
+                    match catch_unwind(AssertUnwindSafe(|| on_receive(data, h.msg_type))) {
+                        Ok(Ok(())) => {
+                            if h.sequence != 0 {
+                                Self::remember_processed_sequence(
+                                    &mut processed_sequences,
+                                    &mut processed_sequence_order,
+                                    h.sequence,
+                                );
+                            }
+                            if Self::write_sender_control_frame(&sender, TYPE_ACK, h.sequence)
+                                .is_err()
+                            {
+                                return ConnectionEnd::PeerClosed;
+                            }
+                        }
+                        Ok(Err(_)) => {
+                            if Self::write_sender_control_frame(&sender, TYPE_NACK, h.sequence)
+                                .is_err()
+                            {
+                                return ConnectionEnd::PeerClosed;
+                            }
+                        }
+                        Err(_) => return ConnectionEnd::ReceiveHandlerPanicked,
                     }
                 }
                 Err(error) => return Self::connection_end_from_io(&error),
+            }
+        }
+    }
+
+    fn remember_processed_sequence(
+        processed_sequences: &mut HashSet<u16>,
+        sequence_order: &mut VecDeque<u16>,
+        sequence: u16,
+    ) {
+        if !processed_sequences.insert(sequence) {
+            return;
+        }
+        sequence_order.push_back(sequence);
+        const MAX_PROCESSED_SEQUENCES: usize = 4096;
+        while sequence_order.len() > MAX_PROCESSED_SEQUENCES {
+            if let Some(expired) = sequence_order.pop_front() {
+                processed_sequences.remove(&expired);
             }
         }
     }
@@ -273,6 +337,20 @@ impl NetworkManager {
     ) -> std::io::Result<()> {
         stream.write_all(&MessageHeader::new(msg_type, 0, sequence).to_bytes())?;
         stream.flush()
+    }
+
+    fn write_sender_control_frame(
+        sender: &Arc<Mutex<Option<TcpStream>>>,
+        msg_type: u8,
+        sequence: u16,
+    ) -> std::io::Result<()> {
+        let mut sender = sender
+            .lock()
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "Sender unavailable"))?;
+        let stream = sender.as_mut().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotConnected, "Not connected")
+        })?;
+        Self::write_control_frame(stream, msg_type, sequence)
     }
 
     fn configure_connected_stream(stream: &TcpStream) -> std::io::Result<()> {
@@ -360,9 +438,10 @@ impl NetworkManager {
         stream.set_read_timeout(Some(HEARTBEAT_TIMEOUT))
     }
 
-    pub fn start_server<F>(&self, port: u16, on_receive: F) -> Result<(), String>
+    pub fn start_server<F, R>(&self, port: u16, on_receive: F) -> Result<(), String>
     where
-        F: Fn(Vec<u8>, u8) + Send + Sync + 'static,
+        F: Fn(Vec<u8>, u8) -> R + Send + Sync + 'static,
+        R: ReceiveOutcome,
     {
         self.disconnect();
         Self::transition_status(
@@ -372,7 +451,8 @@ impl NetworkManager {
             "server listening",
         );
         let session_id = self.session.fetch_add(1, Ordering::SeqCst) + 1;
-        let on_receive: ReceiveHandler = Arc::new(on_receive);
+        let on_receive: ReceiveHandler =
+            Arc::new(move |data, msg_type| on_receive(data, msg_type).into_receive_result());
 
         let addr = format!("0.0.0.0:{}", port);
         let listener = match TcpListener::bind(&addr) {
@@ -447,6 +527,7 @@ impl NetworkManager {
                         session.clone(),
                         session_id,
                         on_receive.clone(),
+                        sender.clone(),
                         ack_waiters.clone(),
                     );
                     Self::fail_ack_waiters_for(&ack_waiters);
@@ -483,9 +564,10 @@ impl NetworkManager {
         Ok(())
     }
 
-    pub fn connect_to_server<F>(&self, ip: &str, port: u16, on_receive: F) -> Result<(), String>
+    pub fn connect_to_server<F, R>(&self, ip: &str, port: u16, on_receive: F) -> Result<(), String>
     where
-        F: Fn(Vec<u8>, u8) + Send + Sync + 'static,
+        F: Fn(Vec<u8>, u8) -> R + Send + Sync + 'static,
+        R: ReceiveOutcome,
     {
         self.disconnect();
         Self::transition_status(
@@ -498,7 +580,9 @@ impl NetworkManager {
         let target = ClientTarget {
             ip: ip.to_string(),
             port,
-            on_receive: Arc::new(on_receive),
+            on_receive: Arc::new(move |data, msg_type| {
+                on_receive(data, msg_type).into_receive_result()
+            }),
         };
         *self.client_target.lock().unwrap() = Some(target.clone());
 
@@ -564,6 +648,7 @@ impl NetworkManager {
                             session.clone(),
                             session_id,
                             target.on_receive.clone(),
+                            sender.clone(),
                             ack_waiters.clone(),
                         );
                         Self::fail_ack_waiters_for(&ack_waiters);
@@ -656,7 +741,7 @@ impl NetworkManager {
 
     fn send_with_ack(&self, msg_type: u8, data: &[u8]) -> Result<(), String> {
         let sequence = self.next_message_sequence();
-        let waiter: AckWaiter = Arc::new((Mutex::new(false), Condvar::new()));
+        let waiter: AckWaiter = Arc::new((Mutex::new(None), Condvar::new()));
         self.ack_waiters
             .lock()
             .map_err(|_| "Network acknowledgement state is unavailable".to_string())?
@@ -670,35 +755,43 @@ impl NetworkManager {
         }
 
         let (completed, wake) = &*waiter;
-        let acknowledged = completed
+        let completion = completed
             .lock()
             .ok()
             .and_then(|completed| {
-                wake.wait_timeout_while(completed, MESSAGE_ACK_TIMEOUT, |done| !*done)
+                wake.wait_timeout_while(completed, MESSAGE_ACK_TIMEOUT, |done| done.is_none())
                     .ok()
                     .map(|(completed, _)| *completed)
             })
-            .unwrap_or(false);
+            .unwrap_or(None);
         if let Ok(mut waiters) = self.ack_waiters.lock() {
             waiters.remove(&sequence);
         }
-        if acknowledged {
+        if completion == Some(true) {
             return Ok(());
         }
 
         self.close_streams();
         self.fail_ack_waiters();
+        let (reason, error) = if completion == Some(false) {
+            ("message rejected; retrying", "Peer rejected the message")
+        } else {
+            (
+                "message acknowledgement timeout; retrying",
+                "Peer did not acknowledge the message",
+            )
+        };
         Self::transition_status(
             &self.status,
             &self.status_handler,
             self.status_after_connection_loss(),
-            "message acknowledgement timeout; retrying",
+            reason,
         );
-        Err("Peer did not acknowledge the message".to_string())
+        Err(error.to_string())
     }
 
     pub fn send_text(&self, text: &str) -> Result<(), String> {
-        self.send(TYPE_TEXT, text.as_bytes(), 0)
+        self.send_with_ack(TYPE_TEXT, text.as_bytes())
     }
 
     pub fn send_wechat(&self, message: &WeChatMessage) -> Result<(), String> {
@@ -708,12 +801,12 @@ impl NetworkManager {
 
     pub fn send_image(&self, width: usize, height: usize, data: &[u8]) -> Result<(), String> {
         let payload = encode_image(width, height, data)?;
-        self.send(TYPE_IMAGE, &payload, 0)
+        self.send_with_ack(TYPE_IMAGE, &payload)
     }
 
     pub fn send_file_data(&self, filename: &str, contents: &[u8]) -> Result<(), String> {
         let payload = encode_file(filename, contents)?;
-        self.send(TYPE_FILE, &payload, 0)
+        self.send_with_ack(TYPE_FILE, &payload)
     }
 
     pub fn send_file(
@@ -722,15 +815,22 @@ impl NetworkManager {
         file_size: u64,
         chunks: impl Iterator<Item = Vec<u8>>,
     ) -> Result<(), String> {
-        let metadata = FileMetadata {
-            filename: filename.to_string(),
-            file_size,
-        };
-        self.send(TYPE_FILE, &metadata.to_bytes(), 0)?;
-        for (i, chunk) in chunks.enumerate() {
-            self.send(TYPE_FILE, &chunk, (i + 1) as u16)?;
+        let capacity = usize::try_from(file_size)
+            .map_err(|_| "File is too large for this platform".to_string())?;
+        if capacity > MAX_MESSAGE_SIZE {
+            return Err("Message exceeds the 100 MB transfer limit".to_string());
         }
-        Ok(())
+        let mut contents = Vec::with_capacity(capacity);
+        for chunk in chunks {
+            contents.extend_from_slice(&chunk);
+            if contents.len() > MAX_MESSAGE_SIZE {
+                return Err("Message exceeds the 100 MB transfer limit".to_string());
+            }
+        }
+        if contents.len() as u64 != file_size {
+            return Err("File contents do not match the declared size".to_string());
+        }
+        self.send_file_data(filename, &contents)
     }
 }
 
@@ -743,6 +843,7 @@ impl Default for NetworkManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
@@ -875,6 +976,83 @@ mod tests {
     }
 
     #[test]
+    fn clipboard_send_reports_remote_processing_failure() {
+        let port = available_port();
+        let server = NetworkManager::new();
+        let client = NetworkManager::new();
+
+        server
+            .start_server(port, |_, _| Err("clipboard write failed".to_string()))
+            .unwrap();
+        client
+            .connect_to_server("127.0.0.1", port, |_, _| {})
+            .unwrap();
+        wait_for_connected(&[&server, &client]);
+
+        let error = client.send_text("rejected clipboard").unwrap_err();
+        assert!(error.contains("rejected"));
+
+        client.disconnect();
+        server.disconnect();
+    }
+
+    #[test]
+    fn duplicate_sequence_is_processed_once_but_acknowledged_again() {
+        let port = available_port();
+        let server = NetworkManager::new();
+        let client = NetworkManager::new();
+        let processed = Arc::new(AtomicUsize::new(0));
+        let processed_by_server = Arc::clone(&processed);
+
+        server
+            .start_server(port, move |_, _| {
+                processed_by_server.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .unwrap();
+        client
+            .connect_to_server("127.0.0.1", port, |_, _| {})
+            .unwrap();
+        wait_for_connected(&[&server, &client]);
+
+        client.send(TYPE_TEXT, b"duplicate", 41).unwrap();
+        client.send(TYPE_TEXT, b"duplicate", 41).unwrap();
+        thread::sleep(Duration::from_millis(150));
+
+        assert_eq!(processed.load(Ordering::SeqCst), 1);
+        client.disconnect();
+        server.disconnect();
+    }
+
+    #[test]
+    fn text_image_and_file_clipboard_payloads_all_wait_for_ack() {
+        let port = available_port();
+        let server = NetworkManager::new();
+        let client = NetworkManager::new();
+        let processed = Arc::new(AtomicUsize::new(0));
+        let processed_by_server = Arc::clone(&processed);
+
+        server
+            .start_server(port, move |_, _| {
+                processed_by_server.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .unwrap();
+        client
+            .connect_to_server("127.0.0.1", port, |_, _| {})
+            .unwrap();
+        wait_for_connected(&[&server, &client]);
+
+        client.send_text("ack text").unwrap();
+        client.send_image(1, 1, &[255, 0, 0, 255]).unwrap();
+        client.send_file_data("ack.txt", b"ack file").unwrap();
+
+        assert_eq!(processed.load(Ordering::SeqCst), 3);
+        client.disconnect();
+        server.disconnect();
+    }
+
+    #[test]
     fn client_started_before_server_retries_until_the_server_is_available() {
         let port = available_port();
         let server = NetworkManager::new();
@@ -969,11 +1147,13 @@ mod tests {
         let client = NetworkManager::new();
         server.start_server(port, |_, _| {}).unwrap();
         client
-            .connect_to_server("127.0.0.1", port, |_, _| panic!("callback failed"))
+            .connect_to_server("127.0.0.1", port, |_, _| -> Result<(), String> {
+                panic!("callback failed")
+            })
             .unwrap();
         wait_for_connected(&[&server, &client]);
 
-        server.send_text("trigger callback").unwrap();
+        server.send(TYPE_TEXT, b"trigger callback", 0).unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);
         while client.get_status() == ConnectionStatus::Connected && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(10));
