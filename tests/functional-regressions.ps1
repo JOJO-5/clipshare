@@ -35,6 +35,15 @@ if ($wechatMonitor -notmatch 'contains\(&keyword\)') {
 if ($wechatMonitor -notmatch 'SessionClickTracker') {
     throw 'WeChat monitoring must prevent repeated clicks while a session remains unread.'
 }
+if ($wechatMonitor -notmatch 'UIInvokePattern' -or $wechatMonitor -notmatch 'UISelectionItemPattern') {
+    throw 'WeChat monitoring must prefer non-mouse UIA activation for background windows.'
+}
+if ($wechatMonitor -notmatch 'GetForegroundWindow' -or $wechatMonitor -notmatch 'IsIconic') {
+    throw 'Mouse fallback must be restricted to an interactive foreground WeChat window.'
+}
+if ($wechatMonitor -notmatch 'SESSION_CLICK_RETRY_INTERVAL') {
+    throw 'Unread session activation must retry when the unread indicator remains visible.'
+}
 if ($wechatMonitor -notmatch 'monitor_thread\.join\(\)') {
     throw 'Stopping WeChat monitoring must wait for its worker thread to exit.'
 }

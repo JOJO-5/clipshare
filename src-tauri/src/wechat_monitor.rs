@@ -1,11 +1,16 @@
 use crate::wechat::WeChatMessage;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
 };
 use std::thread;
 use std::time::{Duration, Instant};
+
+#[cfg(windows)]
+use uiautomation::patterns::{UIInvokePattern, UISelectionItemPattern};
+#[cfg(windows)]
+use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, IsIconic, IsWindowVisible};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UiMessageNode {
@@ -487,24 +492,80 @@ pub struct WeChatMonitor {
     thread: Option<thread::JoinHandle<()>>,
 }
 
+const SESSION_CLICK_RETRY_INTERVAL: Duration = Duration::from_secs(3);
+
 #[derive(Debug, Default)]
 struct SessionClickTracker {
-    clicked_unread_ids: HashSet<String>,
+    last_attempt_at: HashMap<String, Instant>,
 }
 
 impl SessionClickTracker {
     fn sync_unread_ids(&mut self, unread_ids: &[String]) {
         let current_ids = unread_ids.iter().collect::<HashSet<_>>();
-        self.clicked_unread_ids
-            .retain(|clicked_id| current_ids.contains(clicked_id));
+        self.last_attempt_at
+            .retain(|runtime_id, _| current_ids.contains(runtime_id));
     }
 
     fn was_clicked(&self, runtime_id: &str) -> bool {
-        self.clicked_unread_ids.contains(runtime_id)
+        self.last_attempt_at
+            .get(runtime_id)
+            .map(|last_attempt| last_attempt.elapsed() < SESSION_CLICK_RETRY_INTERVAL)
+            .unwrap_or(false)
     }
 
     fn mark_clicked(&mut self, runtime_id: &str) {
-        self.clicked_unread_ids.insert(runtime_id.to_string());
+        self.last_attempt_at
+            .insert(runtime_id.to_string(), Instant::now());
+    }
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionActivationMethod {
+    Invoke,
+    Select,
+    Mouse,
+}
+
+#[cfg(windows)]
+fn activate_unread_session(
+    item: &uiautomation::UIElement,
+    window: &uiautomation::UIElement,
+) -> Option<SessionActivationMethod> {
+    if let Ok(invoke) = item.get_pattern::<UIInvokePattern>() {
+        if invoke.invoke().is_ok() {
+            return Some(SessionActivationMethod::Invoke);
+        }
+    }
+
+    if let Ok(selection) = item.get_pattern::<UISelectionItemPattern>() {
+        if selection.select().is_ok() {
+            return Some(SessionActivationMethod::Select);
+        }
+    }
+
+    if can_use_mouse_fallback(window) && item.click().is_ok() {
+        return Some(SessionActivationMethod::Mouse);
+    }
+
+    None
+}
+
+#[cfg(windows)]
+fn can_use_mouse_fallback(window: &uiautomation::UIElement) -> bool {
+    let Ok(handle) = window.get_native_window_handle() else {
+        return false;
+    };
+    if handle.is_invalid() {
+        return false;
+    }
+
+    let raw: isize = handle.into();
+    let hwnd = windows::Win32::Foundation::HWND(raw as *mut std::ffi::c_void);
+    unsafe {
+        IsWindowVisible(hwnd).as_bool()
+            && !IsIconic(hwnd).as_bool()
+            && GetForegroundWindow() == hwnd
     }
 }
 
@@ -883,11 +944,11 @@ fn scan_wechat_window(
             if click_tracker.was_clicked(&runtime_id) {
                 continue;
             }
-            if item.click().is_err() {
+            click_tracker.mark_clicked(&runtime_id);
+            if activate_unread_session(item, window).is_none() {
                 messages.extend(message_from_unread_session(&runtime_id, &session));
                 continue;
             }
-            click_tracker.mark_clicked(&runtime_id);
             opened_sessions += 1;
             let current_nodes =
                 retry_until_minimum(6, Duration::from_millis(100), session.unread_count, || {
@@ -1600,6 +1661,18 @@ mod tests {
 
         tracker.sync_unread_ids(&[]);
         tracker.sync_unread_ids(&unread);
+        assert!(!tracker.was_clicked("session-42"));
+    }
+
+    #[test]
+    fn session_click_tracker_retries_when_unread_state_stays_visible() {
+        let mut tracker = SessionClickTracker::default();
+        let unread = vec!["session-42".to_string()];
+
+        tracker.sync_unread_ids(&unread);
+        tracker.mark_clicked("session-42");
+        thread::sleep(Duration::from_millis(3_100));
+
         assert!(!tracker.was_clicked("session-42"));
     }
 
