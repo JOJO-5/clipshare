@@ -519,6 +519,13 @@ impl SessionClickTracker {
     }
 }
 
+fn should_retry_mouse_after_activation(
+    message_nodes: &[UiMessageNode],
+    mouse_fallback_available: bool,
+) -> bool {
+    message_nodes.is_empty() && mouse_fallback_available
+}
+
 #[cfg(windows)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SessionActivationMethod {
@@ -945,12 +952,13 @@ fn scan_wechat_window(
                 continue;
             }
             click_tracker.mark_clicked(&runtime_id);
-            if activate_unread_session(item, window).is_none() {
+            let activation_method = activate_unread_session(item, window);
+            if activation_method.is_none() {
                 messages.extend(message_from_unread_session(&runtime_id, &session));
                 continue;
             }
             opened_sessions += 1;
-            let current_nodes =
+            let mut current_nodes =
                 retry_until_minimum(6, Duration::from_millis(100), session.unread_count, || {
                     let current_lists =
                         find_wechat_lists(automation, tree_walker, window, prefer_raw);
@@ -969,6 +977,37 @@ fn scan_wechat_window(
                         .filter(|node| node.incoming)
                         .collect()
                 });
+            let mouse_fallback_available = activation_method
+                != Some(SessionActivationMethod::Mouse)
+                && can_use_mouse_fallback(window);
+            if should_retry_mouse_after_activation(&current_nodes, mouse_fallback_available) {
+                if item.click().is_ok() {
+                    current_nodes = retry_until_minimum(
+                        6,
+                        Duration::from_millis(100),
+                        session.unread_count,
+                        || {
+                            let current_lists =
+                                find_wechat_lists(automation, tree_walker, window, prefer_raw);
+                            let current_items = current_lists
+                                .iter()
+                                .flat_map(|list| tree_walker.get_children(list).unwrap_or_default())
+                                .collect::<Vec<_>>();
+                            let wechat4_nodes =
+                                parse_wechat4_message_nodes(&current_items, &session.name);
+                            let current_nodes = if wechat4_nodes.is_empty() {
+                                parse_message_nodes(automation, &current_items)
+                            } else {
+                                wechat4_nodes
+                            };
+                            current_nodes
+                                .into_iter()
+                                .filter(|node| node.incoming)
+                                .collect()
+                        },
+                    );
+                }
+            }
             messages.extend(messages_from_opened_session(
                 &runtime_id,
                 &session,
@@ -1674,6 +1713,20 @@ mod tests {
         thread::sleep(Duration::from_millis(3_100));
 
         assert!(!tracker.was_clicked("session-42"));
+    }
+
+    #[test]
+    fn retries_mouse_activation_only_when_uia_produced_no_message_nodes() {
+        let node = UiMessageNode {
+            runtime_id: "message-1".to_string(),
+            sender: "Alice".to_string(),
+            content: "hello".to_string(),
+            incoming: true,
+        };
+
+        assert!(should_retry_mouse_after_activation(&[], true));
+        assert!(!should_retry_mouse_after_activation(&[node], true));
+        assert!(!should_retry_mouse_after_activation(&[], false));
     }
 
     #[test]

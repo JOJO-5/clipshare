@@ -44,6 +44,9 @@ if ($wechatMonitor -notmatch 'GetForegroundWindow' -or $wechatMonitor -notmatch 
 if ($wechatMonitor -notmatch 'SESSION_CLICK_RETRY_INTERVAL') {
     throw 'Unread session activation must retry when the unread indicator remains visible.'
 }
+if ($wechatMonitor -notmatch 'should_retry_mouse_after_activation') {
+    throw 'UIA activation must be verified and retried with the foreground mouse fallback when no message nodes appear.'
+}
 if ($wechatMonitor -notmatch 'monitor_thread\.join\(\)') {
     throw 'Stopping WeChat monitoring must wait for its worker thread to exit.'
 }
