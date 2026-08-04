@@ -1,8 +1,9 @@
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream, ToSocketAddrs};
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -26,6 +27,7 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(100);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(15);
 #[cfg(test)]
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_millis(350);
+const MESSAGE_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 use crate::config::AppConfig;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -37,6 +39,7 @@ pub enum ConnectionStatus {
 
 type ReceiveHandler = Arc<dyn Fn(Vec<u8>, u8) + Send + Sync + 'static>;
 type StatusHandler = Arc<dyn Fn(ConnectionStatus, &str) + Send + Sync + 'static>;
+type AckWaiter = Arc<(Mutex<bool>, Condvar)>;
 
 #[derive(Debug, Clone, Copy)]
 enum ConnectionEnd {
@@ -72,8 +75,10 @@ pub struct NetworkManager {
     receiver: Arc<Mutex<Option<TcpStream>>>,
     config: Arc<Mutex<AppConfig>>,
     session: Arc<AtomicU64>,
+    next_sequence: AtomicU16,
     client_target: Arc<Mutex<Option<ClientTarget>>>,
     status_handler: Arc<Mutex<Option<StatusHandler>>>,
+    ack_waiters: Arc<Mutex<HashMap<u16, AckWaiter>>>,
 }
 
 impl NetworkManager {
@@ -84,8 +89,10 @@ impl NetworkManager {
             receiver: Arc::new(Mutex::new(None)),
             config: Arc::new(Mutex::new(AppConfig::load())),
             session: Arc::new(AtomicU64::new(0)),
+            next_sequence: AtomicU16::new(1),
             client_target: Arc::new(Mutex::new(None)),
             status_handler: Arc::new(Mutex::new(None)),
+            ack_waiters: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -145,6 +152,7 @@ impl NetworkManager {
 
     fn stop_current_session(&self) {
         self.session.fetch_add(1, Ordering::SeqCst);
+        self.fail_ack_waiters();
         self.close_streams();
         Self::transition_status(
             &self.status,
@@ -157,6 +165,29 @@ impl NetworkManager {
     pub fn disconnect(&self) {
         *self.client_target.lock().unwrap() = None;
         self.stop_current_session();
+    }
+
+    fn fail_ack_waiters(&self) {
+        Self::fail_ack_waiters_for(&self.ack_waiters);
+    }
+
+    fn fail_ack_waiters_for(ack_waiters: &Arc<Mutex<HashMap<u16, AckWaiter>>>) {
+        let waiters = ack_waiters
+            .lock()
+            .map(|mut waiters| {
+                waiters
+                    .drain()
+                    .map(|(_, waiter)| waiter)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for waiter in waiters {
+            let (completed, wake) = &*waiter;
+            if let Ok(mut completed) = completed.lock() {
+                *completed = false;
+                wake.notify_all();
+            }
+        }
     }
 
     fn status_after_connection_loss(&self) -> ConnectionStatus {
@@ -172,6 +203,7 @@ impl NetworkManager {
         session: Arc<AtomicU64>,
         session_id: u64,
         on_receive: ReceiveHandler,
+        ack_waiters: Arc<Mutex<HashMap<u16, AckWaiter>>>,
     ) -> ConnectionEnd {
         loop {
             if session.load(Ordering::SeqCst) != session_id {
@@ -189,6 +221,18 @@ impl NetworkManager {
                     if h.msg_type == TYPE_HEARTBEAT {
                         continue;
                     }
+                    if h.msg_type == TYPE_ACK {
+                        if let Ok(mut waiters) = ack_waiters.lock() {
+                            if let Some(waiter) = waiters.remove(&h.sequence) {
+                                let (completed, wake) = &*waiter;
+                                if let Ok(mut completed) = completed.lock() {
+                                    *completed = true;
+                                    wake.notify_all();
+                                }
+                            }
+                        }
+                        continue;
+                    }
                     if h.data_len as usize > MAX_MESSAGE_SIZE {
                         return ConnectionEnd::ProtocolError;
                     }
@@ -198,6 +242,9 @@ impl NetworkManager {
                     }
                     if catch_unwind(AssertUnwindSafe(|| on_receive(data, h.msg_type))).is_err() {
                         return ConnectionEnd::ReceiveHandlerPanicked;
+                    }
+                    if Self::write_control_frame(&mut receiver, TYPE_ACK, h.sequence).is_err() {
+                        return ConnectionEnd::PeerClosed;
                     }
                 }
                 Err(error) => return Self::connection_end_from_io(&error),
@@ -219,8 +266,12 @@ impl NetworkManager {
         }
     }
 
-    fn write_control_frame(stream: &mut TcpStream, msg_type: u8) -> std::io::Result<()> {
-        stream.write_all(&MessageHeader::new(msg_type, 0, 0).to_bytes())?;
+    fn write_control_frame(
+        stream: &mut TcpStream,
+        msg_type: u8,
+        sequence: u16,
+    ) -> std::io::Result<()> {
+        stream.write_all(&MessageHeader::new(msg_type, 0, sequence).to_bytes())?;
         stream.flush()
     }
 
@@ -273,7 +324,7 @@ impl NetworkManager {
                         .ok_or_else(|| {
                             std::io::Error::new(std::io::ErrorKind::NotConnected, "Not connected")
                         })
-                        .and_then(|stream| Self::write_control_frame(stream, TYPE_HEARTBEAT))
+                        .and_then(|stream| Self::write_control_frame(stream, TYPE_HEARTBEAT, 0))
                 });
             if result.is_err() {
                 if !stop.load(Ordering::SeqCst) && session.load(Ordering::SeqCst) == session_id {
@@ -351,6 +402,7 @@ impl NetworkManager {
         let status = self.status.clone();
         let status_handler = self.status_handler.clone();
         let session = self.session.clone();
+        let ack_waiters = self.ack_waiters.clone();
 
         thread::spawn(move || loop {
             if session.load(Ordering::SeqCst) != session_id {
@@ -362,7 +414,7 @@ impl NetworkManager {
                     if Self::configure_connected_stream(&stream).is_err() {
                         continue;
                     }
-                    if Self::write_control_frame(&mut stream, TYPE_ACK).is_err() {
+                    if Self::write_control_frame(&mut stream, TYPE_ACK, 0).is_err() {
                         continue;
                     }
                     let send_stream = match stream.try_clone() {
@@ -390,8 +442,14 @@ impl NetworkManager {
                         session_id,
                         heartbeat_stop.clone(),
                     );
-                    let connection_end =
-                        Self::receive_loop(stream, session.clone(), session_id, on_receive.clone());
+                    let connection_end = Self::receive_loop(
+                        stream,
+                        session.clone(),
+                        session_id,
+                        on_receive.clone(),
+                        ack_waiters.clone(),
+                    );
+                    Self::fail_ack_waiters_for(&ack_waiters);
                     heartbeat_stop.store(true, Ordering::SeqCst);
                     if session.load(Ordering::SeqCst) != session_id {
                         return;
@@ -450,6 +508,7 @@ impl NetworkManager {
         let status_handler = self.status_handler.clone();
         let session = self.session.clone();
         let client_target = self.client_target.clone();
+        let ack_waiters = self.ack_waiters.clone();
 
         thread::spawn(move || {
             let mut retry_delay = Duration::from_millis(250);
@@ -505,7 +564,9 @@ impl NetworkManager {
                             session.clone(),
                             session_id,
                             target.on_receive.clone(),
+                            ack_waiters.clone(),
                         );
+                        Self::fail_ack_waiters_for(&ack_waiters);
                         heartbeat_stop.store(true, Ordering::SeqCst);
                         if session.load(Ordering::SeqCst) != session_id {
                             return;
@@ -549,7 +610,7 @@ impl NetworkManager {
         Ok(())
     }
 
-    pub fn send(&self, msg_type: u8, data: &[u8], sequence: u16) -> Result<(), String> {
+    fn send_frame(&self, msg_type: u8, data: &[u8], sequence: u16) -> Result<(), String> {
         if data.len() > MAX_MESSAGE_SIZE {
             return Err("Message exceeds the 100 MB transfer limit".to_string());
         }
@@ -569,6 +630,7 @@ impl NetworkManager {
 
         if result.is_err() {
             self.close_streams();
+            self.fail_ack_waiters();
             Self::transition_status(
                 &self.status,
                 &self.status_handler,
@@ -579,13 +641,69 @@ impl NetworkManager {
         result
     }
 
+    pub fn send(&self, msg_type: u8, data: &[u8], sequence: u16) -> Result<(), String> {
+        self.send_frame(msg_type, data, sequence)
+    }
+
+    fn next_message_sequence(&self) -> u16 {
+        let sequence = self.next_sequence.fetch_add(1, Ordering::Relaxed);
+        if sequence == 0 {
+            1
+        } else {
+            sequence
+        }
+    }
+
+    fn send_with_ack(&self, msg_type: u8, data: &[u8]) -> Result<(), String> {
+        let sequence = self.next_message_sequence();
+        let waiter: AckWaiter = Arc::new((Mutex::new(false), Condvar::new()));
+        self.ack_waiters
+            .lock()
+            .map_err(|_| "Network acknowledgement state is unavailable".to_string())?
+            .insert(sequence, waiter.clone());
+
+        if let Err(error) = self.send_frame(msg_type, data, sequence) {
+            if let Ok(mut waiters) = self.ack_waiters.lock() {
+                waiters.remove(&sequence);
+            }
+            return Err(error);
+        }
+
+        let (completed, wake) = &*waiter;
+        let acknowledged = completed
+            .lock()
+            .ok()
+            .and_then(|completed| {
+                wake.wait_timeout_while(completed, MESSAGE_ACK_TIMEOUT, |done| !*done)
+                    .ok()
+                    .map(|(completed, _)| *completed)
+            })
+            .unwrap_or(false);
+        if let Ok(mut waiters) = self.ack_waiters.lock() {
+            waiters.remove(&sequence);
+        }
+        if acknowledged {
+            return Ok(());
+        }
+
+        self.close_streams();
+        self.fail_ack_waiters();
+        Self::transition_status(
+            &self.status,
+            &self.status_handler,
+            self.status_after_connection_loss(),
+            "message acknowledgement timeout; retrying",
+        );
+        Err("Peer did not acknowledge the message".to_string())
+    }
+
     pub fn send_text(&self, text: &str) -> Result<(), String> {
         self.send(TYPE_TEXT, text.as_bytes(), 0)
     }
 
     pub fn send_wechat(&self, message: &WeChatMessage) -> Result<(), String> {
         let payload = encode_wechat(message)?;
-        self.send(TYPE_WECHAT, &payload, 0)
+        self.send_with_ack(TYPE_WECHAT, &payload)
     }
 
     pub fn send_image(&self, width: usize, height: usize, data: &[u8]) -> Result<(), String> {
@@ -720,6 +838,43 @@ mod tests {
     }
 
     #[test]
+    fn wechat_send_waits_for_remote_processing_ack() {
+        let port = available_port();
+        let server = NetworkManager::new();
+        let client = NetworkManager::new();
+        let (received_tx, received_rx) = mpsc::channel();
+
+        server
+            .start_server(port, move |_, message_type| {
+                if message_type == TYPE_WECHAT {
+                    received_tx.send(()).unwrap();
+                    thread::sleep(Duration::from_millis(100));
+                }
+            })
+            .unwrap();
+        client
+            .connect_to_server("127.0.0.1", port, |_, _| {})
+            .unwrap();
+
+        wait_for_connected(&[&server, &client]);
+        let message = WeChatMessage {
+            id: "ack-check".to_string(),
+            sender: "Alice".to_string(),
+            preview: "hello".to_string(),
+            content: "hello".to_string(),
+            timestamp: 1,
+            unread_count: 1,
+        };
+        let started = Instant::now();
+        client.send_wechat(&message).unwrap();
+
+        assert!(received_rx.recv_timeout(Duration::from_secs(1)).is_ok());
+        assert!(started.elapsed() >= Duration::from_millis(80));
+        client.disconnect();
+        server.disconnect();
+    }
+
+    #[test]
     fn client_started_before_server_retries_until_the_server_is_available() {
         let port = available_port();
         let server = NetworkManager::new();
@@ -836,7 +991,7 @@ mod tests {
         let (heartbeat_tx, heartbeat_rx) = mpsc::channel();
         let peer = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            NetworkManager::write_control_frame(&mut stream, TYPE_ACK).unwrap();
+            NetworkManager::write_control_frame(&mut stream, TYPE_ACK, 0).unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(2)))
                 .unwrap();
@@ -865,7 +1020,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let peer = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            NetworkManager::write_control_frame(&mut stream, TYPE_ACK).unwrap();
+            NetworkManager::write_control_frame(&mut stream, TYPE_ACK, 0).unwrap();
             thread::sleep(Duration::from_secs(2));
         });
         let client = NetworkManager::new();
@@ -891,13 +1046,13 @@ mod tests {
         let (accepted_tx, accepted_rx) = mpsc::channel();
         let peer = thread::spawn(move || {
             let (mut first, _) = listener.accept().unwrap();
-            NetworkManager::write_control_frame(&mut first, TYPE_ACK).unwrap();
+            NetworkManager::write_control_frame(&mut first, TYPE_ACK, 0).unwrap();
             accepted_tx.send(1).unwrap();
             thread::sleep(Duration::from_millis(100));
             drop(first);
 
             let (mut second, _) = listener.accept().unwrap();
-            NetworkManager::write_control_frame(&mut second, TYPE_ACK).unwrap();
+            NetworkManager::write_control_frame(&mut second, TYPE_ACK, 0).unwrap();
             accepted_tx.send(2).unwrap();
             thread::sleep(Duration::from_millis(250));
         });

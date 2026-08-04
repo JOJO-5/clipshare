@@ -24,7 +24,7 @@ function truncatePreview(content: string, limit = 40) {
 }
 
 function wechatNotificationKey(message: WeChatMessage) {
-  if (message.id.startsWith('wechat-unread-') || message.id.startsWith('wechat-session-')) {
+  if (message.id.startsWith('wechat-session-')) {
     return `${message.sender}\u0000${message.content}\u0000${message.unread_count}`
   }
   return message.id

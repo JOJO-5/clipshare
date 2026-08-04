@@ -52,6 +52,11 @@ $uiaActivation = $wechatMonitor.IndexOf('get_pattern::<UIInvokePattern>()')
 if ($mouseActivation -lt 0 -or $uiaActivation -lt 0 -or $mouseActivation -gt $uiaActivation) {
     throw 'Foreground WeChat sessions must prefer the original physical click before UIA activation.'
 }
+$mouseAvailability = $wechatMonitor.IndexOf('let initial_mouse_fallback_available = can_use_mouse_fallback(window)')
+$activationCall = $wechatMonitor.IndexOf('let activation_method = activate_unread_session')
+if ($mouseAvailability -lt 0 -or $activationCall -lt 0 -or $mouseAvailability -gt $activationCall) {
+    throw 'Mouse fallback availability must be captured before UIA can activate a background WeChat window.'
+}
 if ($wechatMonitor -notmatch 'monitor_thread\.join\(\)') {
     throw 'Stopping WeChat monitoring must wait for its worker thread to exit.'
 }
@@ -76,6 +81,9 @@ if ($commands -notmatch 'wechat-pending-save failed' -or $commands -notmatch 'we
 $app = Get-Content -LiteralPath (Join-Path $repoRoot 'src\App.tsx') -Raw
 if ($app -notmatch 'wechatNotificationKeys') {
     throw 'WeChat notifications must suppress duplicate native toasts.'
+}
+if ($app -match "message\.id\.startsWith\('wechat-unread-'\)") {
+    throw 'Full unread messages must keep stable occurrence IDs instead of semantic deduplication.'
 }
 if ($workflow -match 'cargo install tauri-cli') {
     throw 'CI must use the npm-installed Tauri CLI instead of compiling tauri-cli with Cargo.'
