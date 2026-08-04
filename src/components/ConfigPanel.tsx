@@ -12,6 +12,7 @@ interface Config {
   wechat_enabled: boolean
   wechat_preview_limit: number
   wechat_show_content: boolean
+  wechat_session_filter: string
   minimize_to_tray: boolean
   autostart: boolean
 }
@@ -54,6 +55,7 @@ export function ConfigPanel() {
           wechat_enabled: values.wechat_enabled ?? true,
           wechat_preview_limit: values.wechat_preview_limit ?? 40,
           wechat_show_content: values.wechat_show_content ?? true,
+          wechat_session_filter: values.wechat_session_filter ?? '',
           minimize_to_tray: values.minimize_to_tray ?? true,
           autostart: values.autostart ?? false,
         },
@@ -88,11 +90,21 @@ export function ConfigPanel() {
     message.info('连接已断开')
   }
 
+  const handleWeChatEnabledChange = async (enabled: boolean) => {
+    try {
+      await invoke('set_wechat_monitor_enabled', { enabled })
+      message.success(enabled ? '微信消息监听已开启' : '微信消息监听已关闭')
+    } catch (error) {
+      form.setFieldValue('wechat_enabled', !enabled)
+      message.error(`切换微信监听失败：${error}`)
+    }
+  }
+
   return (
     <div className="config-panel">
       <div className="config-scroll">
         <div className="section-kicker">连接设置</div>
-        <Form form={form} layout="vertical" initialValues={{ role: 'server', port: 9527, target_port: 9527, max_file_size: 104857600, wechat_enabled: true, wechat_preview_limit: 40, wechat_show_content: true, minimize_to_tray: true, autostart: false }}>
+        <Form form={form} layout="vertical" initialValues={{ role: 'server', port: 9527, target_port: 9527, max_file_size: 104857600, wechat_enabled: true, wechat_preview_limit: 40, wechat_show_content: true, wechat_session_filter: '', minimize_to_tray: true, autostart: false }}>
           <Form.Item name="role" label="运行模式">
             <Radio.Group className="role-switch">
               <Radio.Button value="server">接收端</Radio.Button>
@@ -122,7 +134,14 @@ export function ConfigPanel() {
           </Form.Item>
           <div className="section-kicker">微信消息提示</div>
           <Form.Item name="wechat_enabled" label="启用微信消息提示" valuePropName="checked">
-            <Switch />
+            <Switch onChange={handleWeChatEnabledChange} />
+          </Form.Item>
+          <Form.Item
+            name="wechat_session_filter"
+            label="仅监听指定个人或群"
+            extra="每行填写一个名称关键词，支持模糊匹配；留空表示监听全部"
+          >
+            <Input.TextArea rows={3} placeholder={'例如：\n张三\n项目工作群'} />
           </Form.Item>
           <Form.Item name="wechat_preview_limit" label="通知摘要长度">
             <InputNumber min={1} max={200} addonAfter="字" className="form-control" />

@@ -23,6 +23,21 @@ if ($wechatMonitor -notmatch 'ChatWnd') {
 if ($wechatMonitor -notmatch 'AccessibleObjectFromWindow' -or $wechatMonitor -notmatch 'msaa_nodes') {
     throw 'WeChat monitor must retain the HWND/MSAA fallback and its remote diagnostics.'
 }
+if ($wechatMonitor -notmatch 'item\.click\(\)') {
+    throw 'Active WeChat monitoring must open recognized unread sessions to read full messages.'
+}
+if ($wechatMonitor -notmatch 'should_monitor_session') {
+    throw 'WeChat unread sessions must be filtered before active opening.'
+}
+if ($wechatMonitor -notmatch 'contains\(&keyword\)') {
+    throw 'WeChat session filters must support fuzzy keyword matching.'
+}
+if ($commands -notmatch 'set_wechat_monitor_enabled') {
+    throw 'The WeChat notification switch must reconfigure the running monitor immediately.'
+}
+if ($commands -notmatch 'wechat-send status=failed') {
+    throw 'Failed WeChat notification delivery must be visible in diagnostics.'
+}
 if ($workflow -match 'cargo install tauri-cli') {
     throw 'CI must use the npm-installed Tauri CLI instead of compiling tauri-cli with Cargo.'
 }

@@ -35,9 +35,31 @@ pub fn get_config() -> AppConfig {
 }
 
 #[command]
-pub fn save_config(config: AppConfig) -> Result<(), String> {
+pub fn save_config(
+    config: AppConfig,
+    window: tauri::Window,
+    state: State<AppState>,
+) -> Result<(), String> {
     set_autostart(config.autostart)?;
-    config.save()
+    config.save()?;
+    restart_wechat_monitor(window, state.inner(), config)
+}
+
+#[command]
+pub fn set_wechat_monitor_enabled(
+    enabled: bool,
+    window: tauri::Window,
+    state: State<AppState>,
+) -> Result<(), String> {
+    let mut config = AppConfig::load();
+    config.wechat_enabled = enabled;
+    config.save()?;
+    if enabled {
+        start_wechat_monitor_with_config(window, state.inner(), config)
+    } else {
+        stop_wechat_monitor(&window, state.inner());
+        Ok(())
+    }
 }
 
 const MAX_RECEIVED_FILES: usize = 100;
@@ -258,6 +280,37 @@ pub fn send_wechat(message: WeChatMessage, state: State<AppState>) -> Result<(),
 #[command]
 pub fn start_wechat_monitor(window: tauri::Window, state: State<AppState>) -> Result<(), String> {
     let config = AppConfig::load();
+    start_wechat_monitor_with_config(window, state.inner(), config)
+}
+
+fn restart_wechat_monitor(
+    window: tauri::Window,
+    state: &AppState,
+    config: AppConfig,
+) -> Result<(), String> {
+    stop_wechat_monitor(&window, state);
+    start_wechat_monitor_with_config(window, state, config)
+}
+
+fn stop_wechat_monitor(window: &tauri::Window, state: &AppState) {
+    let stopped = state
+        .wechat_monitor
+        .lock()
+        .map(|mut monitor| monitor.take().is_some())
+        .unwrap_or(false);
+    if stopped {
+        let entry = LogEntry::info("wechat-monitor", "wechat-monitor stopped");
+        entry.write_to_file().ok();
+        state.logs.lock().unwrap().push(entry.clone());
+        let _ = window.app_handle().emit("wechat-monitor-log", &entry);
+    }
+}
+
+fn start_wechat_monitor_with_config(
+    window: tauri::Window,
+    state: &AppState,
+    config: AppConfig,
+) -> Result<(), String> {
     if !config.wechat_enabled {
         let entry = LogEntry::info("wechat-monitor", "wechat-monitor disabled by config");
         entry.write_to_file().ok();
@@ -276,11 +329,13 @@ pub fn start_wechat_monitor(window: tauri::Window, state: State<AppState>) -> Re
     let network = Arc::clone(&state.network);
     let window_clone = window.clone();
     let diagnostic_window = window.clone();
+    let last_delivery_failure = Arc::new(Mutex::new(None));
     let preview_limit = config.wechat_preview_limit.max(1);
     let monitor = WeChatMonitor::start(
+        config.wechat_session_filter.clone(),
         move |message| {
             let message = prepare_wechat_message(message, preview_limit);
-            let delivered = network
+            let delivery = network
                 .lock()
                 .map_err(|_| "Network state is unavailable".to_string())
                 .and_then(|net| {
@@ -288,17 +343,43 @@ pub fn start_wechat_monitor(window: tauri::Window, state: State<AppState>) -> Re
                         return Err("Not connected".to_string());
                     }
                     net.send_wechat(&message)
-                })
-                .is_ok();
+                });
 
-            if delivered {
-                let entry =
-                    LogEntry::send("wechat", &message.preview, message.content.len() as u64);
-                entry.write_to_file().ok();
-                logs.lock().unwrap().push(entry);
-                let _ = window_clone.app_handle().emit("wechat-sent", &message);
+            match delivery {
+                Ok(()) => {
+                    if let Ok(mut previous) = last_delivery_failure.lock() {
+                        *previous = None;
+                    }
+                    let entry =
+                        LogEntry::send("wechat", &message.preview, message.content.len() as u64);
+                    entry.write_to_file().ok();
+                    logs.lock().unwrap().push(entry);
+                    let _ = window_clone.app_handle().emit("wechat-sent", &message);
+                    true
+                }
+                Err(error) => {
+                    let should_log = last_delivery_failure
+                        .lock()
+                        .map(|mut previous| {
+                            should_log_wechat_delivery_failure(
+                                &mut previous,
+                                &error,
+                                SystemTime::now(),
+                            )
+                        })
+                        .unwrap_or(true);
+                    if should_log {
+                        let entry = LogEntry::info(
+                            "wechat-monitor",
+                            &format!("wechat-send status=failed error={error}"),
+                        );
+                        entry.write_to_file().ok();
+                        logs.lock().unwrap().push(entry.clone());
+                        let _ = window_clone.app_handle().emit("wechat-monitor-log", &entry);
+                    }
+                    false
+                }
             }
-            delivered
         },
         move |diagnostic| {
             let entry = LogEntry::info("wechat-monitor", &diagnostic);
@@ -312,6 +393,27 @@ pub fn start_wechat_monitor(window: tauri::Window, state: State<AppState>) -> Re
 
     *monitor_slot = Some(monitor);
     Ok(())
+}
+
+fn should_log_wechat_delivery_failure(
+    previous: &mut Option<(String, SystemTime)>,
+    error: &str,
+    now: SystemTime,
+) -> bool {
+    let should_log = previous
+        .as_ref()
+        .map(|(previous_error, previous_time)| {
+            previous_error != error
+                || now
+                    .duration_since(*previous_time)
+                    .map(|elapsed| elapsed >= Duration::from_secs(5))
+                    .unwrap_or(true)
+        })
+        .unwrap_or(true);
+    if should_log {
+        *previous = Some((error.to_string(), now));
+    }
+    should_log
 }
 
 #[command]
@@ -500,6 +602,33 @@ mod tests {
             crate::clipboard::ClipboardContent::Text("pending transfer".to_string()),
         )
         .is_err());
+    }
+
+    #[test]
+    fn rate_limits_repeated_wechat_delivery_failures() {
+        let start = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let mut previous = None;
+
+        assert!(should_log_wechat_delivery_failure(
+            &mut previous,
+            "Not connected",
+            start,
+        ));
+        assert!(!should_log_wechat_delivery_failure(
+            &mut previous,
+            "Not connected",
+            start + Duration::from_secs(1),
+        ));
+        assert!(should_log_wechat_delivery_failure(
+            &mut previous,
+            "Not connected",
+            start + Duration::from_secs(5),
+        ));
+        assert!(should_log_wechat_delivery_failure(
+            &mut previous,
+            "Connection reset",
+            start + Duration::from_secs(6),
+        ));
     }
 
     #[test]

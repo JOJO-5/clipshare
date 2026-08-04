@@ -43,6 +43,7 @@ pub fn run() {
             clear_logs,
             start_clipboard_monitor,
             start_wechat_monitor,
+            set_wechat_monitor_enabled,
         ])
         .setup(move |app| {
             // Build tray icon menu
