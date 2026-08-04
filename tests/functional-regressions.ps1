@@ -35,6 +35,9 @@ if ($wechatMonitor -notmatch 'contains\(&keyword\)') {
 if ($wechatMonitor -notmatch 'SessionClickTracker') {
     throw 'WeChat monitoring must prevent repeated clicks while a session remains unread.'
 }
+if ($wechatMonitor -notmatch 'monitor_thread\.join\(\)') {
+    throw 'Stopping WeChat monitoring must wait for its worker thread to exit.'
+}
 if ($commands -notmatch 'set_wechat_monitor_enabled') {
     throw 'The WeChat notification switch must reconfigure the running monitor immediately.'
 }
@@ -43,6 +46,12 @@ if ($commands -notmatch 'wechat-send status=failed') {
 }
 if ($workflow -match 'cargo install tauri-cli') {
     throw 'CI must use the npm-installed Tauri CLI instead of compiling tauri-cli with Cargo.'
+}
+if ($workflow -notmatch 'pull_request:') {
+    throw 'Pull requests must run the build workflow automatically.'
+}
+if ($workflow -notmatch 'win7-webview2-config\.ps1') {
+    throw 'CI must run the Win7 WebView2 configuration regression test.'
 }
 if ($packageJson -notmatch '"@tauri-apps/cli"') {
     throw 'CI must install the Tauri CLI through package-lock via npm ci.'

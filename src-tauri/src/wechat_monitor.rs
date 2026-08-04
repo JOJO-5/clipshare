@@ -366,6 +366,7 @@ fn messages_from_opened_session(
 pub struct MessageTracker {
     initialized: bool,
     delivered_ids: HashSet<String>,
+    pending_messages: Vec<WeChatMessage>,
 }
 
 impl MessageTracker {
@@ -375,32 +376,37 @@ impl MessageTracker {
             .map(|message| message.id.clone())
             .collect::<HashSet<_>>();
         if !self.initialized {
-            let pending = messages
-                .iter()
-                .filter(|message| {
-                    message.id.starts_with("wechat-unread-")
-                        || message.id.starts_with("wechat-session-")
-                })
-                .cloned()
-                .collect();
-            self.delivered_ids.extend(current_ids);
+            for message in messages {
+                if message.id.starts_with("wechat-unread-")
+                    || message.id.starts_with("wechat-session-")
+                {
+                    self.pending_messages.push(message);
+                } else {
+                    self.delivered_ids.insert(message.id);
+                }
+            }
             self.initialized = true;
-            return pending;
+        } else {
+            self.delivered_ids
+                .retain(|message_id| current_ids.contains(message_id));
+
+            for message in messages {
+                if !self.delivered_ids.contains(&message.id)
+                    && !self
+                        .pending_messages
+                        .iter()
+                        .any(|pending| pending.id == message.id)
+                {
+                    self.pending_messages.push(message);
+                }
+            }
         }
 
-        self.delivered_ids
-            .retain(|message_id| current_ids.contains(message_id));
-
-        let mut batch_ids = HashSet::new();
-        messages
-            .into_iter()
-            .filter(|message| {
-                !self.delivered_ids.contains(&message.id) && batch_ids.insert(message.id.clone())
-            })
-            .collect()
+        self.pending_messages.clone()
     }
 
     pub fn mark_delivered(&mut self, id: &str) {
+        self.pending_messages.retain(|message| message.id != id);
         self.delivered_ids.insert(id.to_string());
     }
 }
@@ -452,6 +458,7 @@ fn select_message_content(
 
 pub struct WeChatMonitor {
     stop: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
 }
 
 #[derive(Debug, Default)]
@@ -489,7 +496,7 @@ impl WeChatMonitor {
         {
             let stop = Arc::new(AtomicBool::new(false));
             let thread_stop = Arc::clone(&stop);
-            thread::spawn(move || {
+            let monitor_thread = thread::spawn(move || {
                 let automation = match uiautomation::UIAutomation::new() {
                     Ok(automation) => automation,
                     Err(error) => {
@@ -541,7 +548,10 @@ impl WeChatMonitor {
                     thread::sleep(Duration::from_millis(500));
                 }
             });
-            return Ok(Self { stop });
+            return Ok(Self {
+                stop,
+                thread: Some(monitor_thread),
+            });
         }
 
         #[cfg(not(windows))]
@@ -556,6 +566,11 @@ impl WeChatMonitor {
 impl Drop for WeChatMonitor {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+        if let Some(monitor_thread) = self.thread.take() {
+            if monitor_thread.thread().id() != thread::current().id() {
+                let _ = monitor_thread.join();
+            }
+        }
     }
 }
 
@@ -1742,6 +1757,25 @@ mod tests {
         let pending = tracker.ingest(vec![history, unread.clone()]);
 
         assert_eq!(pending, vec![unread]);
+    }
+
+    #[test]
+    fn tracker_retries_initial_unread_when_delivery_fails() {
+        let unread = WeChatMessage {
+            id: "wechat-unread-session-1-message-1".to_string(),
+            sender: "Bob".to_string(),
+            preview: String::new(),
+            content: "new".to_string(),
+            timestamp: 2,
+            unread_count: 1,
+        };
+        let mut tracker = MessageTracker::default();
+
+        assert_eq!(tracker.ingest(vec![unread.clone()]), vec![unread.clone()]);
+        assert_eq!(tracker.ingest(Vec::new()), vec![unread.clone()]);
+
+        tracker.mark_delivered(&unread.id);
+        assert!(tracker.ingest(Vec::new()).is_empty());
     }
 
     #[test]
