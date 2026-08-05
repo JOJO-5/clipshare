@@ -18,6 +18,7 @@ interface WeChatMessage {
 
 const { Title } = Typography
 const WECHAT_NOTIFICATION_DEDUP_WINDOW_MS = 30_000
+const WECHAT_NATIVE_NOTIFICATION_COOLDOWN_MS = 30_000
 
 function truncatePreview(content: string, limit = 40) {
   return content.length <= limit ? content : `${Array.from(content).slice(0, limit).join('')}…`
@@ -33,6 +34,10 @@ function wechatNotificationKey(message: WeChatMessage) {
 function wechatNotificationGroup(message: WeChatMessage) {
   const sender = message.sender.trim().toLowerCase()
   return `wechat-sender-${sender || 'unknown'}`
+}
+
+function shouldSendNativeWechatNotification(lastSentAt: number | undefined, now: number) {
+  return lastSentAt === undefined || now - lastSentAt >= WECHAT_NATIVE_NOTIFICATION_COOLDOWN_MS
 }
 
 function combineWechatMessages(messages: WeChatMessage[]) {
@@ -55,11 +60,9 @@ function App() {
   const wechatMessages = useRef(new Map<string, WeChatMessage>())
   const wechatNotificationKeys = useRef(new Map<string, number>())
   const wechatNotificationGroups = useRef(new Map<string, WeChatMessage[]>())
+  const wechatNativeNotificationTimes = useRef(new Map<string, number>())
 
   useEffect(() => {
-    invoke('start_clipboard_monitor').catch(console.error)
-    invoke('start_wechat_monitor').catch(() => undefined)
-
     let disposed = false
     let stopChanged: (() => void) | undefined
     let stopReceived: (() => void) | undefined
@@ -78,6 +81,13 @@ function App() {
       } catch {
         permissionGranted = false
       }
+      appendLog({
+        time: new Date().toISOString(),
+        type: 'info',
+        dataType: 'wechat',
+        content: `wechat-notification permission=${permissionGranted ? 'granted' : 'denied'}`,
+        size: 0,
+      })
 
       try {
         const notificationActionListener = await onAction(action => {
@@ -88,6 +98,7 @@ function App() {
               const groupKey = wechatNotificationGroup(message)
               const groupedMessages = wechatNotificationGroups.current.get(groupKey) ?? [message]
               wechatNotificationGroups.current.delete(groupKey)
+              wechatNativeNotificationTimes.current.delete(groupKey)
               notificationApi.destroy(groupKey)
               setSelectedWeChat(combineWechatMessages(groupedMessages))
             }
@@ -120,7 +131,10 @@ function App() {
 
           const preview = truncatePreview(event.payload.preview || event.payload.content)
           const groupKey = wechatNotificationGroup(event.payload)
-          const hasPendingNotification = wechatNotificationGroups.current.has(groupKey)
+          const shouldSendNativeNotification = shouldSendNativeWechatNotification(
+            wechatNativeNotificationTimes.current.get(groupKey),
+            now,
+          )
           const groupedMessages = [
             ...(wechatNotificationGroups.current.get(groupKey) ?? []),
             event.payload,
@@ -146,18 +160,37 @@ function App() {
             onClick: () => {
               const messages = wechatNotificationGroups.current.get(groupKey) ?? [event.payload]
               wechatNotificationGroups.current.delete(groupKey)
+              wechatNativeNotificationTimes.current.delete(groupKey)
               notificationApi.destroy(groupKey)
               setSelectedWeChat(combineWechatMessages(messages))
             },
           })
-          if (permissionGranted && !hasPendingNotification) {
-            sendNotification({
+          if (permissionGranted && shouldSendNativeNotification) {
+            wechatNativeNotificationTimes.current.set(groupKey, now)
+            try {
+              sendNotification({
               id: Math.abs(hashMessageId(groupKey)),
               title: `微信消息 · ${event.payload.sender}`,
               body: groupedDescription,
               extra: { messageId: event.payload.id },
               autoCancel: true,
-            })
+              })
+              appendLog({
+                time: new Date().toISOString(),
+                type: 'info',
+                dataType: 'wechat',
+                content: `wechat-notification status=sent sender=${event.payload.sender}`,
+                size: 0,
+              })
+            } catch (error: unknown) {
+              appendLog({
+                time: new Date().toISOString(),
+                type: 'error',
+                dataType: 'wechat',
+                content: `wechat-notification status=failed error=${String(error)}`,
+                size: 0,
+              })
+            }
           }
         }),
         listen<LogEntry>('wechat-monitor-log', event => appendLog(event.payload)),
@@ -191,7 +224,13 @@ function App() {
         console.error(error)
       }
     }
-    subscribeToLogs().catch(console.error)
+    subscribeToLogs()
+      .then(() => {
+        if (disposed) return
+        void invoke('start_clipboard_monitor').catch(console.error)
+        void invoke('start_wechat_monitor').catch(console.error)
+      })
+      .catch(console.error)
     return () => {
       disposed = true
       stopChanged?.()

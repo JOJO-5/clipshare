@@ -99,8 +99,22 @@ $app = Get-Content -LiteralPath (Join-Path $repoRoot 'src\App.tsx') -Raw
 if ($app -notmatch 'wechatNotificationKeys') {
     throw 'WeChat notifications must suppress duplicate native toasts.'
 }
-if ($app -notmatch 'wechatNotificationGroups' -or $app -notmatch 'key: groupKey' -or $app -notmatch 'hasPendingNotification') {
+if ($app -notmatch 'wechatNotificationGroups' -or $app -notmatch 'key: groupKey') {
     throw 'WeChat notifications must collapse multiple messages from one sender.'
+}
+if ($app -match 'hasPendingNotification') {
+    throw 'A pending notification must not permanently suppress later WeChat notifications.'
+}
+if ($app -notmatch 'WECHAT_NATIVE_NOTIFICATION_COOLDOWN_MS' -or $app -notmatch 'shouldSendNativeWechatNotification') {
+    throw 'WeChat native notifications must use a repeatable cooldown instead of permanent pending suppression.'
+}
+if ($app -notmatch 'wechat-notification permission=' -or $app -notmatch 'wechat-notification status=sent' -or $app -notmatch 'wechat-notification status=failed') {
+    throw 'WeChat notification permission and send outcomes must be visible in diagnostics.'
+}
+$subscribeCall = $app.LastIndexOf('subscribeToLogs()')
+$wechatMonitorStart = $app.IndexOf("invoke('start_wechat_monitor')")
+if ($subscribeCall -lt 0 -or $wechatMonitorStart -lt 0 -or $wechatMonitorStart -lt $subscribeCall) {
+    throw 'WeChat monitor must start only after frontend event listeners are registered.'
 }
 if ($app -match "message\.id\.startsWith\('wechat-unread-'\)") {
     throw 'Full unread messages must keep stable occurrence IDs instead of semantic deduplication.'
