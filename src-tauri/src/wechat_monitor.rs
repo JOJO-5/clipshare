@@ -1,11 +1,16 @@
 use crate::wechat::WeChatMessage;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
 };
 use std::thread;
 use std::time::{Duration, Instant};
+
+#[cfg(windows)]
+use uiautomation::patterns::{UIInvokePattern, UISelectionItemPattern};
+#[cfg(windows)]
+use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, IsIconic, IsWindowVisible};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UiMessageNode {
@@ -21,6 +26,12 @@ struct UiScanSummary {
     sessions: usize,
     unread_sessions: usize,
     opened_sessions: usize,
+    activation_attempts: usize,
+    activation_invoke: usize,
+    activation_select: usize,
+    activation_mouse: usize,
+    activation_failures: usize,
+    mouse_retries: usize,
     lists: usize,
     items: usize,
     parsed_nodes: usize,
@@ -78,11 +89,17 @@ fn format_native_accessibility_diagnostic(snapshot: &NativeAccessibilitySnapshot
 impl UiScanSummary {
     fn format_log(&self) -> String {
         format!(
-            "wechat-ui windows={} sessions={} unread_sessions={} opened_sessions={} lists={} items={} parsed={} incoming={} text_nodes={} messages={}",
+            "wechat-ui windows={} sessions={} unread_sessions={} opened_sessions={} activation_attempts={} activation_invoke={} activation_select={} activation_mouse={} activation_failures={} mouse_retries={} lists={} items={} parsed={} incoming={} text_nodes={} messages={}",
             self.windows,
             self.sessions,
             self.unread_sessions,
             self.opened_sessions,
+            self.activation_attempts,
+            self.activation_invoke,
+            self.activation_select,
+            self.activation_mouse,
+            self.activation_failures,
+            self.mouse_retries,
             self.lists,
             self.items,
             self.parsed_nodes,
@@ -91,6 +108,12 @@ impl UiScanSummary {
             self.messages,
         )
     }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct WeChatScanState {
+    snapshot_valid: bool,
+    active_sessions: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -296,16 +319,20 @@ where
     F: FnMut() -> Vec<T>,
 {
     let attempts = attempts.max(1);
+    let mut best_values = Vec::new();
     for attempt in 0..attempts {
         let values = scan();
         if values.len() >= minimum {
             return values;
         }
+        if values.len() > best_values.len() {
+            best_values = values;
+        }
         if attempt + 1 < attempts && !delay.is_zero() {
             thread::sleep(delay);
         }
     }
-    Vec::new()
+    best_values
 }
 
 fn should_scan_wechat_fallback(summary: &UiScanSummary) -> bool {
@@ -360,8 +387,13 @@ fn messages_from_opened_session(
     let mut selected = messages[start..]
         .iter()
         .cloned()
-        .map(|mut message| {
-            message.id = format!("wechat-unread-{}-{}", runtime_id, message.id);
+        .enumerate()
+        .map(|(occurrence, mut message)| {
+            let absolute_index = start + occurrence;
+            message.id = format!(
+                "wechat-unread-index-{}-{}-{}",
+                absolute_index, message.sender, message.content
+            );
             message
         })
         .collect::<Vec<_>>();
@@ -376,10 +408,35 @@ fn messages_from_opened_session(
     selected
 }
 
+fn unread_delivery_key(message: &WeChatMessage) -> Option<String> {
+    if message.id.starts_with("wechat-unread-index-") {
+        return Some(format!(
+            "full\u{1f}{}\u{1f}{}",
+            message.sender.trim(),
+            message.id
+        ));
+    }
+    if message.id.starts_with("wechat-unread-") || message.id.starts_with("wechat-session-") {
+        return Some(format!(
+            "preview\u{1f}{}\u{1f}{}\u{1f}{}",
+            message.sender.trim(),
+            message.content.trim(),
+            message.unread_count
+        ));
+    }
+    None
+}
+
+fn unread_session_key(message: &WeChatMessage) -> Option<String> {
+    unread_delivery_key(message).map(|_| message.sender.trim().to_lowercase())
+}
+
 #[derive(Debug, Default)]
 pub struct MessageTracker {
     initialized: bool,
     delivered_ids: HashSet<String>,
+    delivered_unread_keys: HashMap<String, String>,
+    unread_absence_scans: usize,
     pending_messages: Vec<WeChatMessage>,
 }
 
@@ -388,20 +445,32 @@ impl MessageTracker {
         Self {
             initialized: true,
             delivered_ids: HashSet::new(),
+            delivered_unread_keys: HashMap::new(),
+            unread_absence_scans: 0,
             pending_messages,
         }
     }
 
     pub fn ingest(&mut self, messages: Vec<WeChatMessage>) -> Vec<WeChatMessage> {
+        self.ingest_with_unread_sessions(messages, None)
+    }
+
+    pub fn ingest_with_unread_sessions(
+        &mut self,
+        messages: Vec<WeChatMessage>,
+        active_sessions: Option<&[String]>,
+    ) -> Vec<WeChatMessage> {
         let current_ids = messages
             .iter()
             .map(|message| message.id.clone())
             .collect::<HashSet<_>>();
+        let current_unread_keys = messages
+            .iter()
+            .filter_map(unread_delivery_key)
+            .collect::<HashSet<_>>();
         if !self.initialized {
             for message in messages {
-                if message.id.starts_with("wechat-unread-")
-                    || message.id.starts_with("wechat-session-")
-                {
+                if unread_delivery_key(&message).is_some() {
                     self.pending_messages.push(message);
                 } else {
                     self.delivered_ids.insert(message.id);
@@ -411,13 +480,37 @@ impl MessageTracker {
         } else {
             self.delivered_ids
                 .retain(|message_id| current_ids.contains(message_id));
+            if let Some(active_sessions) = active_sessions {
+                let active_sessions = active_sessions
+                    .iter()
+                    .map(|session| session.trim().to_lowercase())
+                    .collect::<HashSet<_>>();
+                if active_sessions.is_empty() && messages.is_empty() {
+                    self.unread_absence_scans = self.unread_absence_scans.saturating_add(1);
+                    if self.unread_absence_scans >= 2 {
+                        self.delivered_unread_keys.clear();
+                    }
+                } else {
+                    self.unread_absence_scans = 0;
+                    self.delivered_unread_keys
+                        .retain(|_, session| active_sessions.contains(session));
+                }
+            } else {
+                self.delivered_unread_keys
+                    .retain(|key, _| current_unread_keys.contains(key));
+            }
 
             for message in messages {
+                let unread_key = unread_delivery_key(&message);
                 if !self.delivered_ids.contains(&message.id)
-                    && !self
-                        .pending_messages
-                        .iter()
-                        .any(|pending| pending.id == message.id)
+                    && !unread_key
+                        .as_ref()
+                        .map(|key| self.delivered_unread_keys.contains_key(key))
+                        .unwrap_or(false)
+                    && !self.pending_messages.iter().any(|pending| {
+                        pending.id == message.id
+                            || unread_key.as_ref() == unread_delivery_key(pending).as_ref()
+                    })
                 {
                     self.pending_messages.push(message);
                 }
@@ -428,8 +521,21 @@ impl MessageTracker {
     }
 
     pub fn mark_delivered(&mut self, id: &str) {
+        let unread_message = self
+            .pending_messages
+            .iter()
+            .find(|message| message.id == id)
+            .cloned();
         self.pending_messages.retain(|message| message.id != id);
         self.delivered_ids.insert(id.to_string());
+        if let Some(unread_message) = unread_message {
+            if let (Some(unread_key), Some(session_key)) = (
+                unread_delivery_key(&unread_message),
+                unread_session_key(&unread_message),
+            ) {
+                self.delivered_unread_keys.insert(unread_key, session_key);
+            }
+        }
     }
 
     pub fn pending_messages(&self) -> Vec<WeChatMessage> {
@@ -487,24 +593,92 @@ pub struct WeChatMonitor {
     thread: Option<thread::JoinHandle<()>>,
 }
 
+const SESSION_CLICK_RETRY_INTERVAL: Duration = Duration::from_secs(3);
+
+fn session_click_key(name: &str) -> String {
+    name.trim().to_lowercase()
+}
+
 #[derive(Debug, Default)]
 struct SessionClickTracker {
-    clicked_unread_ids: HashSet<String>,
+    last_attempt_at: HashMap<String, Instant>,
 }
 
 impl SessionClickTracker {
     fn sync_unread_ids(&mut self, unread_ids: &[String]) {
         let current_ids = unread_ids.iter().collect::<HashSet<_>>();
-        self.clicked_unread_ids
-            .retain(|clicked_id| current_ids.contains(clicked_id));
+        self.last_attempt_at
+            .retain(|runtime_id, _| current_ids.contains(runtime_id));
     }
 
     fn was_clicked(&self, runtime_id: &str) -> bool {
-        self.clicked_unread_ids.contains(runtime_id)
+        self.last_attempt_at
+            .get(runtime_id)
+            .map(|last_attempt| last_attempt.elapsed() < SESSION_CLICK_RETRY_INTERVAL)
+            .unwrap_or(false)
     }
 
     fn mark_clicked(&mut self, runtime_id: &str) {
-        self.clicked_unread_ids.insert(runtime_id.to_string());
+        self.last_attempt_at
+            .insert(runtime_id.to_string(), Instant::now());
+    }
+}
+
+fn should_retry_mouse_after_activation(
+    message_nodes: &[UiMessageNode],
+    mouse_fallback_available: bool,
+    activation_used_mouse: bool,
+) -> bool {
+    message_nodes.is_empty() && mouse_fallback_available && !activation_used_mouse
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionActivationMethod {
+    Invoke,
+    Select,
+    Mouse,
+}
+
+#[cfg(windows)]
+fn activate_unread_session(
+    item: &uiautomation::UIElement,
+    window: &uiautomation::UIElement,
+) -> Option<SessionActivationMethod> {
+    if can_use_mouse_fallback(window) && item.click().is_ok() {
+        return Some(SessionActivationMethod::Mouse);
+    }
+
+    if let Ok(invoke) = item.get_pattern::<UIInvokePattern>() {
+        if invoke.invoke().is_ok() {
+            return Some(SessionActivationMethod::Invoke);
+        }
+    }
+
+    if let Ok(selection) = item.get_pattern::<UISelectionItemPattern>() {
+        if selection.select().is_ok() {
+            return Some(SessionActivationMethod::Select);
+        }
+    }
+
+    None
+}
+
+#[cfg(windows)]
+fn can_use_mouse_fallback(window: &uiautomation::UIElement) -> bool {
+    let Ok(handle) = window.get_native_window_handle() else {
+        return false;
+    };
+    if handle.is_invalid() {
+        return false;
+    }
+
+    let raw: isize = handle.into();
+    let hwnd = windows::Win32::Foundation::HWND(raw as *mut std::ffi::c_void);
+    unsafe {
+        IsWindowVisible(hwnd).as_bool()
+            && !IsIconic(hwnd).as_bool()
+            && GetForegroundWindow() == hwnd
     }
 }
 
@@ -540,7 +714,7 @@ impl WeChatMonitor {
                 let mut last_pending_log = Instant::now() - Duration::from_secs(5);
 
                 while !thread_stop.load(Ordering::Relaxed) {
-                    let (messages, summary) =
+                    let (messages, summary, scan_state) =
                         scan_wechat(&automation, &session_filter, &mut click_tracker);
                     if last_summary.as_ref() != Some(&summary)
                         || last_summary_log.elapsed() >= Duration::from_secs(5)
@@ -561,7 +735,14 @@ impl WeChatMonitor {
 
                     let pending = tracker
                         .lock()
-                        .map(|mut tracker| tracker.ingest(messages))
+                        .map(|mut tracker| {
+                            tracker.ingest_with_unread_sessions(
+                                messages,
+                                scan_state
+                                    .snapshot_valid
+                                    .then_some(scan_state.active_sessions.as_slice()),
+                            )
+                        })
                         .unwrap_or_default();
                     if !pending.is_empty() && last_pending_log.elapsed() >= Duration::from_secs(5) {
                         on_diagnostic(format!(
@@ -617,30 +798,33 @@ fn scan_wechat(
     automation: &uiautomation::UIAutomation,
     session_filter: &str,
     click_tracker: &mut SessionClickTracker,
-) -> (Vec<WeChatMessage>, UiScanSummary) {
+) -> (Vec<WeChatMessage>, UiScanSummary, WeChatScanState) {
     let main_windows = find_wechat_main_windows(automation);
     let mut summary = UiScanSummary {
         windows: main_windows.len(),
         ..UiScanSummary::default()
     };
     let mut messages = Vec::new();
+    let mut scan_state = WeChatScanState::default();
     for window in main_windows {
-        let (window_messages, window_summary) =
+        let (window_messages, window_summary, window_scan_state) =
             scan_wechat_window(automation, &window, session_filter, click_tracker);
         merge_scan_summary(&mut summary, &window_summary);
+        merge_scan_state(&mut scan_state, &window_scan_state);
         messages.extend(window_messages);
     }
     if should_scan_wechat_fallback(&summary) {
         for window in find_wechat_windows(automation) {
-            let (window_messages, window_summary) =
+            let (window_messages, window_summary, window_scan_state) =
                 scan_wechat_window(automation, &window, session_filter, click_tracker);
             summary.windows += 1;
             merge_scan_summary(&mut summary, &window_summary);
+            merge_scan_state(&mut scan_state, &window_scan_state);
             messages.extend(window_messages);
         }
     }
     summary.messages = messages.len();
-    (messages, summary)
+    (messages, summary, scan_state)
 }
 
 #[cfg(windows)]
@@ -648,6 +832,12 @@ fn merge_scan_summary(target: &mut UiScanSummary, source: &UiScanSummary) {
     target.sessions += source.sessions;
     target.unread_sessions += source.unread_sessions;
     target.opened_sessions += source.opened_sessions;
+    target.activation_attempts += source.activation_attempts;
+    target.activation_invoke += source.activation_invoke;
+    target.activation_select += source.activation_select;
+    target.activation_mouse += source.activation_mouse;
+    target.activation_failures += source.activation_failures;
+    target.mouse_retries += source.mouse_retries;
     target.lists += source.lists;
     target.items += source.items;
     target.parsed_nodes += source.parsed_nodes;
@@ -655,6 +845,16 @@ fn merge_scan_summary(target: &mut UiScanSummary, source: &UiScanSummary) {
     target.text_nodes += source.text_nodes;
     if target.tree_diagnostic.is_none() {
         target.tree_diagnostic = source.tree_diagnostic.clone();
+    }
+}
+
+#[cfg(windows)]
+fn merge_scan_state(target: &mut WeChatScanState, source: &WeChatScanState) {
+    target.snapshot_valid |= source.snapshot_valid;
+    for session in &source.active_sessions {
+        if !target.active_sessions.contains(session) {
+            target.active_sessions.push(session.clone());
+        }
     }
 }
 
@@ -755,10 +955,16 @@ fn scan_wechat_window(
     window: &uiautomation::UIElement,
     session_filter: &str,
     click_tracker: &mut SessionClickTracker,
-) -> (Vec<WeChatMessage>, UiScanSummary) {
+) -> (Vec<WeChatMessage>, UiScanSummary, WeChatScanState) {
     let control_walker = match automation.get_control_view_walker() {
         Ok(walker) => walker,
-        Err(_) => return (Vec::new(), UiScanSummary::default()),
+        Err(_) => {
+            return (
+                Vec::new(),
+                UiScanSummary::default(),
+                WeChatScanState::default(),
+            )
+        }
     };
     let raw_walker = automation.get_raw_view_walker().ok();
     let original_control_descendants = collect_ui_descendants(&control_walker, window, 1200).len();
@@ -848,48 +1054,40 @@ fn scan_wechat_window(
             .collect::<Vec<_>>();
         let unread_sessions = unread_targets.len();
         let nodes = parse_message_nodes(automation, &items);
-        let unread_runtime_ids = unread_targets
+        let active_sessions = unread_targets
             .iter()
-            .map(|(item, session)| {
-                item.get_runtime_id()
-                    .ok()
-                    .map(|parts| {
-                        parts
-                            .into_iter()
-                            .map(|part| part.to_string())
-                            .collect::<Vec<_>>()
-                            .join("-")
-                    })
-                    .filter(|runtime_id| !runtime_id.is_empty())
-                    .unwrap_or_else(|| format!("session:{}", session.name))
-            })
+            .map(|(_, session)| session_click_key(&session.name))
             .collect::<Vec<_>>();
-        click_tracker.sync_unread_ids(&unread_runtime_ids);
+        click_tracker.sync_unread_ids(&active_sessions);
         let mut messages = Vec::new();
         let mut opened_sessions = 0;
+        let mut activation_attempts = 0;
+        let mut activation_invoke = 0;
+        let mut activation_select = 0;
+        let mut activation_mouse = 0;
+        let mut activation_failures = 0;
+        let mut mouse_retries = 0;
         for (item, session) in unread_targets {
-            let runtime_id = item
-                .get_runtime_id()
-                .ok()
-                .map(|parts| {
-                    parts
-                        .into_iter()
-                        .map(|part| part.to_string())
-                        .collect::<Vec<_>>()
-                        .join("-")
-                })
-                .filter(|runtime_id| !runtime_id.is_empty())
-                .unwrap_or_else(|| format!("session:{}", session.name));
-            if click_tracker.was_clicked(&runtime_id) {
+            let session_key = session_click_key(&session.name);
+            if click_tracker.was_clicked(&session_key) {
                 continue;
             }
-            if item.click().is_err() {
-                messages.extend(message_from_unread_session(&runtime_id, &session));
+            click_tracker.mark_clicked(&session_key);
+            activation_attempts += 1;
+            let initial_mouse_fallback_available = can_use_mouse_fallback(window);
+            let activation_method = activate_unread_session(item, window);
+            match activation_method {
+                Some(SessionActivationMethod::Invoke) => activation_invoke += 1,
+                Some(SessionActivationMethod::Select) => activation_select += 1,
+                Some(SessionActivationMethod::Mouse) => activation_mouse += 1,
+                None => activation_failures += 1,
+            }
+            if activation_method.is_none() {
+                messages.extend(message_from_unread_session(&session_key, &session));
                 continue;
             }
-            click_tracker.mark_clicked(&runtime_id);
             opened_sessions += 1;
-            let current_nodes =
+            let mut current_nodes =
                 retry_until_minimum(6, Duration::from_millis(100), session.unread_count, || {
                     let current_lists =
                         find_wechat_lists(automation, tree_walker, window, prefer_raw);
@@ -908,8 +1106,41 @@ fn scan_wechat_window(
                         .filter(|node| node.incoming)
                         .collect()
                 });
+            if should_retry_mouse_after_activation(
+                &current_nodes,
+                initial_mouse_fallback_available,
+                activation_method == Some(SessionActivationMethod::Mouse),
+            ) {
+                mouse_retries += 1;
+                if item.click().is_ok() {
+                    current_nodes = retry_until_minimum(
+                        6,
+                        Duration::from_millis(100),
+                        session.unread_count,
+                        || {
+                            let current_lists =
+                                find_wechat_lists(automation, tree_walker, window, prefer_raw);
+                            let current_items = current_lists
+                                .iter()
+                                .flat_map(|list| tree_walker.get_children(list).unwrap_or_default())
+                                .collect::<Vec<_>>();
+                            let wechat4_nodes =
+                                parse_wechat4_message_nodes(&current_items, &session.name);
+                            let current_nodes = if wechat4_nodes.is_empty() {
+                                parse_message_nodes(automation, &current_items)
+                            } else {
+                                wechat4_nodes
+                            };
+                            current_nodes
+                                .into_iter()
+                                .filter(|node| node.incoming)
+                                .collect()
+                        },
+                    );
+                }
+            }
             messages.extend(messages_from_opened_session(
-                &runtime_id,
+                &session_key,
                 &session,
                 &current_nodes,
             ));
@@ -921,6 +1152,12 @@ fn scan_wechat_window(
                 sessions: unread_sessions,
                 unread_sessions,
                 opened_sessions,
+                activation_attempts,
+                activation_invoke,
+                activation_select,
+                activation_mouse,
+                activation_failures,
+                mouse_retries,
                 lists: lists.len(),
                 items: items.len(),
                 parsed_nodes: nodes.len(),
@@ -938,6 +1175,10 @@ fn scan_wechat_window(
                     )
                 }),
                 ..UiScanSummary::default()
+            },
+            WeChatScanState {
+                snapshot_valid: true,
+                active_sessions,
             },
         );
     }
@@ -968,6 +1209,7 @@ fn scan_wechat_window(
             )),
             ..UiScanSummary::default()
         },
+        WeChatScanState::default(),
     )
 }
 
@@ -1479,6 +1721,12 @@ mod tests {
             sessions: 4,
             unread_sessions: 2,
             opened_sessions: 1,
+            activation_attempts: 1,
+            activation_invoke: 1,
+            activation_select: 0,
+            activation_mouse: 0,
+            activation_failures: 0,
+            mouse_retries: 0,
             lists: 2,
             items: 8,
             parsed_nodes: 6,
@@ -1490,7 +1738,7 @@ mod tests {
 
         assert_eq!(
             summary.format_log(),
-            "wechat-ui windows=1 sessions=4 unread_sessions=2 opened_sessions=1 lists=2 items=8 parsed=6 incoming=3 text_nodes=0 messages=3"
+            "wechat-ui windows=1 sessions=4 unread_sessions=2 opened_sessions=1 activation_attempts=1 activation_invoke=1 activation_select=0 activation_mouse=0 activation_failures=0 mouse_retries=0 lists=2 items=8 parsed=6 incoming=3 text_nodes=0 messages=3"
         );
     }
 
@@ -1604,6 +1852,40 @@ mod tests {
     }
 
     #[test]
+    fn session_click_tracker_retries_when_unread_state_stays_visible() {
+        let mut tracker = SessionClickTracker::default();
+        let unread = vec!["session-42".to_string()];
+
+        tracker.sync_unread_ids(&unread);
+        tracker.mark_clicked("session-42");
+        thread::sleep(Duration::from_millis(3_100));
+
+        assert!(!tracker.was_clicked("session-42"));
+    }
+
+    #[test]
+    fn retries_mouse_activation_only_when_uia_produced_no_message_nodes() {
+        let node = UiMessageNode {
+            runtime_id: "message-1".to_string(),
+            sender: "Alice".to_string(),
+            content: "hello".to_string(),
+            incoming: true,
+        };
+
+        assert!(should_retry_mouse_after_activation(&[], true, false));
+        assert!(!should_retry_mouse_after_activation(&[node], true, false));
+        assert!(!should_retry_mouse_after_activation(&[], false, false));
+        assert!(!should_retry_mouse_after_activation(&[], true, true));
+    }
+
+    #[test]
+    fn retry_returns_the_best_partial_scan_after_exhausting_attempts() {
+        let values = retry_until_minimum(3, Duration::ZERO, 3, || vec!["partial"]);
+
+        assert_eq!(values, vec!["partial"]);
+    }
+
+    #[test]
     fn falls_back_to_session_preview_when_opened_chat_has_no_message_nodes() {
         let session = WeChatSession {
             name: "\u{5f20}\u{4e09}".to_string(),
@@ -1666,6 +1948,12 @@ mod tests {
             sessions: 0,
             unread_sessions: 0,
             opened_sessions: 0,
+            activation_attempts: 0,
+            activation_invoke: 0,
+            activation_select: 0,
+            activation_mouse: 0,
+            activation_failures: 0,
+            mouse_retries: 0,
             lists: 0,
             items: 0,
             parsed_nodes: 0,
@@ -1679,6 +1967,12 @@ mod tests {
             sessions: 0,
             unread_sessions: 0,
             opened_sessions: 0,
+            activation_attempts: 0,
+            activation_invoke: 0,
+            activation_select: 0,
+            activation_mouse: 0,
+            activation_failures: 0,
+            mouse_retries: 0,
             lists: 1,
             items: 4,
             parsed_nodes: 4,
@@ -1881,6 +2175,161 @@ mod tests {
         let pending = tracker.ingest(vec![duplicate.clone(), duplicate]);
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].id, "wechat-ui-duplicate");
+    }
+
+    #[test]
+    fn tracker_deduplicates_unread_content_when_ui_runtime_id_changes() {
+        let first = WeChatMessage {
+            id: "wechat-unread-session-a-wechat-ui-node-a".to_string(),
+            sender: "Alice".to_string(),
+            preview: String::new(),
+            content: "same unread content".to_string(),
+            timestamp: 1,
+            unread_count: 1,
+        };
+        let second = WeChatMessage {
+            id: "wechat-unread-session-b-wechat-ui-node-b".to_string(),
+            timestamp: 2,
+            ..first.clone()
+        };
+        let mut tracker = MessageTracker::default();
+
+        assert_eq!(tracker.ingest(vec![first.clone()]), vec![first.clone()]);
+        tracker.mark_delivered(&first.id);
+
+        assert!(tracker.ingest(vec![second]).is_empty());
+    }
+
+    #[test]
+    fn tracker_keeps_delivered_unread_state_during_a_valid_empty_click_scan() {
+        let message = WeChatMessage {
+            id: "wechat-session-session-a-1-preview".to_string(),
+            sender: "Alice".to_string(),
+            preview: String::new(),
+            content: "preview".to_string(),
+            timestamp: 1,
+            unread_count: 1,
+        };
+        let mut tracker = MessageTracker::with_pending(Vec::new());
+        let active_sessions = vec!["Alice".to_string()];
+
+        assert_eq!(
+            tracker.ingest_with_unread_sessions(vec![message.clone()], Some(&active_sessions)),
+            vec![message.clone()]
+        );
+        tracker.mark_delivered(&message.id);
+
+        assert!(tracker
+            .ingest_with_unread_sessions(Vec::new(), Some(&active_sessions))
+            .is_empty());
+        assert!(tracker
+            .ingest_with_unread_sessions(Vec::new(), Some(&[]))
+            .is_empty());
+        assert!(tracker
+            .ingest_with_unread_sessions(vec![message.clone()], Some(&active_sessions))
+            .is_empty());
+        assert!(tracker
+            .ingest_with_unread_sessions(Vec::new(), Some(&[]))
+            .is_empty());
+        assert!(tracker
+            .ingest_with_unread_sessions(Vec::new(), Some(&[]))
+            .is_empty());
+        assert_eq!(
+            tracker
+                .ingest_with_unread_sessions(vec![message], Some(&active_sessions))
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn tracker_keeps_identical_messages_separate_by_unread_occurrence() {
+        let session = WeChatSession {
+            name: "Alice".to_string(),
+            unread_count: 2,
+            preview: Some("same".to_string()),
+        };
+        let messages = messages_from_opened_session(
+            "session-a",
+            &session,
+            &[
+                UiMessageNode {
+                    runtime_id: "node-a".to_string(),
+                    sender: "Alice".to_string(),
+                    content: "same".to_string(),
+                    incoming: true,
+                },
+                UiMessageNode {
+                    runtime_id: "node-b".to_string(),
+                    sender: "Alice".to_string(),
+                    content: "same".to_string(),
+                    incoming: true,
+                },
+            ],
+        );
+        let mut tracker = MessageTracker::with_pending(Vec::new());
+
+        assert_eq!(messages.len(), 2);
+        assert_ne!(messages[0].id, messages[1].id);
+        assert_eq!(tracker.ingest(messages).len(), 2);
+    }
+
+    #[test]
+    fn unread_message_ids_keep_their_absolute_position_when_new_messages_arrive() {
+        let session = WeChatSession {
+            name: "Alice".to_string(),
+            unread_count: 1,
+            preview: Some("new".to_string()),
+        };
+        let first_scan = messages_from_opened_session(
+            "session-a",
+            &session,
+            &[
+                UiMessageNode {
+                    runtime_id: "old-1".to_string(),
+                    sender: "Alice".to_string(),
+                    content: "old".to_string(),
+                    incoming: true,
+                },
+                UiMessageNode {
+                    runtime_id: "new-1".to_string(),
+                    sender: "Alice".to_string(),
+                    content: "new".to_string(),
+                    incoming: true,
+                },
+            ],
+        );
+        let second_scan = messages_from_opened_session(
+            "session-a",
+            &WeChatSession {
+                unread_count: 2,
+                ..session
+            },
+            &[
+                UiMessageNode {
+                    runtime_id: "old-1".to_string(),
+                    sender: "Alice".to_string(),
+                    content: "old".to_string(),
+                    incoming: true,
+                },
+                UiMessageNode {
+                    runtime_id: "new-1".to_string(),
+                    sender: "Alice".to_string(),
+                    content: "new".to_string(),
+                    incoming: true,
+                },
+                UiMessageNode {
+                    runtime_id: "new-2".to_string(),
+                    sender: "Alice".to_string(),
+                    content: "new".to_string(),
+                    incoming: true,
+                },
+            ],
+        );
+
+        assert_eq!(first_scan[0].id, "wechat-unread-index-1-Alice-new");
+        assert_eq!(second_scan[0].id, first_scan[0].id);
+        assert_ne!(second_scan[1].id, first_scan[0].id);
     }
 
     #[test]
