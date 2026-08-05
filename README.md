@@ -1,47 +1,74 @@
 # ClipShare
 
-## Tray and startup
+ClipShare 是一个面向局域网的跨平台剪切板共享工具，支持实时同步文本、图片和文件，也可以把 Windows 7 云桌面上的微信新消息转发到 Windows 10/11 端进行通知。
 
-- The configuration page can hide the window to the tray when it is closed or minimized.
-- The tray menu restores the main window or exits ClipShare.
-- “Autostart” uses the current user's Windows Run entry and launches with `--minimized`.
-- The Win7 flavor pins `uiautomation = 0.23.0` so the executable does not import the missing `combase.dll`.
-- The Win7 flavor also uses the `win7-compat` Cargo feature, which leaves the modern WinRT notification plugin out of that binary; Win10/11 remains the notification display endpoint.
-- The Win7 installer bundles the fixed WebView2 109 runtime because newer WebView2 bootstrapper versions call APIs that do not exist on Windows 7.
-- The Win7 executable links the Microsoft WebView2 SDK 1.0.1054.31 loader so it also starts on Windows 7 installations where `EventSetInformation` is absent. CI inspects the final PE import table to prevent this compatibility regression.
-- Client connections remain in `Connecting` and retry with backoff until the receiver is available. After a TCP disconnect, the client reconnects automatically and the server continues accepting a replacement client.
-- On every launch, ClipShare restores the last saved role automatically: receivers resume listening and senders reconnect to the last target. Clicking “Start listening” or “Connect” also persists that endpoint for the next restart.
-- Connections now use a protocol ACK plus 5-second heartbeats. A silent or half-open peer is detected within about 15 seconds, and blocking connect/write operations have timeouts.
-- The log panel records `network-status` transitions and their reason, such as `protocol ack received`, `heartbeat timeout`, `peer closed connection`, or `send failed`.
-- Both peers must run this or a newer build because the protocol ACK and heartbeat checks are not compatible with older ClipShare builds.
-- The log panel records `clipboard-read`, `clipboard-send`, and periodic `clipboard-monitor alive` diagnostics, including failed sends and retry attempts.
+## 下载
 
-ClipShare 是一个面向局域网的剪贴板共享工具，使用 Tauri、React、TypeScript 和 Rust 构建。连接后，设备之间可以实时同步文本、图片和文件。
+正式版本：[v0.1.1 Release](https://github.com/JOJO-5/clipshare/releases/tag/v0.1.1)
+
+常用下载项：
+
+- [Win7 x64 安装包](https://github.com/JOJO-5/clipshare/releases/download/v0.1.1/ClipShare.Win7_0.1.0_x64-setup.exe)：推荐在 Windows 7 上使用，已包含固定版本的 WebView2 Runtime。
+- [Win7 x64 可执行文件](https://github.com/JOJO-5/clipshare/releases/download/v0.1.1/ClipShare-clipshare-win7-x64.exe)：便携版本，运行环境仍需满足 WebView2 要求。
+- [Windows 10/11 安装包](https://github.com/JOJO-5/clipshare/releases/download/v0.1.1/ClipShare_0.1.0_x64-setup.exe)
+- [Windows 10/11 MSI](https://github.com/JOJO-5/clipshare/releases/download/v0.1.1/ClipShare_0.1.0_x64_en-US.msi)
+- macOS、Linux 及其他构建产物请从 [Release 页面](https://github.com/JOJO-5/clipshare/releases/tag/v0.1.1)选择。
+
+> 当前 `v0.1.1` Release 中部分安装器文件名仍带有 `0.1.0`，这是应用包内部版本字段尚未同步；下载时以 Release 标签和文件用途为准。
 
 ## 功能
 
-- 文本、RGBA 图片和文件实时传输
-- TCP 服务端/客户端两种工作模式
-- 连接状态和传输日志
-- 微信消息提示：Win7 端通过 UI Automation 识别旧版微信 `ChatWnd` 或微信 4.0 的 Qt/`mmui::*` 消息列表，Win10/11 端显示系统通知
-- 通知显示短摘要，点击后查看完整微信消息
-- 单条消息最大传输大小为 100 MB
+- 文本、图片和文件实时传输，单条消息最大 100 MB。
+- Server/Client 两种工作模式，默认端口为 `9527`。
+- TCP 协议 ACK、NACK、心跳检测和断线自动重连。
+- 接收端保存文件到 `下载/ClipShare`，并自动清理过旧的接收文件。
+- 支持最小化到系统托盘、托盘恢复和当前用户开机自启。
+- 日志显示连接状态、剪切板读取、发送、接收和失败重试信息。
+
+## 微信消息通知
+
+微信监控通常运行在 Windows 7 华为云桌面上，Windows 10/11 端负责接收并显示系统通知：
+
+1. Win7 端通过 Windows UI Automation 读取微信未读会话和消息。
+2. Win7 端将微信消息通过 ClipShare 网络连接发送到监听端。
+3. Win10/11 端按发送人合并连续消息，并显示系统通知。
+
+通知行为：
+
+- 短消息会显示预览，长消息会截断显示。
+- 连续消息会显示“X 条新消息”和最新预览，避免通知气泡刷屏。
+- 同一发送人持续有新消息时，系统通知最多每 30 秒再次提醒一次。
+- 点击通知后，在 ClipShare 窗口中查看该组完整消息；软件最小化到托盘时需要先打开 ClipShare。
+- 微信自身的“消息免打扰”不会自动关闭 ClipShare 提醒，因为 ClipShare 读取的是微信 UI 中的未读状态，而不是微信系统通知。
+
+微信 UI 结构会随微信版本变化。日志中的 `wechat-ui`、`wechat-ui-tree`、`msaa_*` 和 `activation_*` 字段可用于定位 UI Automation、Raw View 或 MSAA 兼容问题。
 
 ## 系统兼容性
 
-- Windows 7：使用独立的 `ClipShare Win7` 可执行文件，采用 Rust 官方 `x86_64-win7-windows-msvc` target 构建；运行前需准备兼容的 WebView2 运行时
-- Windows 10/11：使用 `ClipShare` 构建包，使用系统或在线安装的 WebView2
-- macOS：Intel 和 Apple Silicon
-- Linux：x64
+| 平台 | 构建 / 运行说明 |
+| --- | --- |
+| Windows 7 x64 | 使用独立的 `ClipShare Win7` 构建，Rust target 为 `x86_64-win7-windows-msvc`，安装包内置 WebView2 109 Runtime。 |
+| Windows 10/11 x64 | 使用现代 Windows 构建，需要系统已安装或能够安装 WebView2 Runtime。 |
+| macOS | 提供 Intel 和 Apple Silicon 构建。 |
+| Linux | 提供 x64 AppImage 和 deb 包。 |
 
-Win7 微信监听依赖 Windows UI Automation。旧版微信优先定位 `ChatWnd`；微信 4.0 Qt 客户端会通过原生 HWND 重新连接 UIA Provider，再使用 Raw View 中的 `mmui::ChatSessionList`、`mmui::MessageView` 和 `mmui::Chat*ItemView`，根据未读会话数量提取最后的新消息，并使用 Runtime ID 去重。若 Qt 客户端的 UIA Control/Raw View 都为空，程序会枚举原生子窗口并尝试 Win7 自带的 MSAA/`IAccessible` 兜底。当前 4.0 兼容逻辑参考了公开的 wxauto4 4.0.5 控件结构；微信升级后控件名仍可能变化。日志中的 `handle_rebound_used`、`raw_descendants`、`native_classes`、`msaa_nodes`、`msaa_error` 和 `msaa_sample` 可用于判断微信暴露了哪一层可访问性数据。华为云桌面需要保持用户会话运行，注销或没有交互桌面时监听可能暂停。
+Win7 构建使用 `uiautomation = 0.23.0`、`win7-compat` Cargo feature 和兼容 WebView2 loader，避免引用 Windows 7 不存在的 API。Win7 与现代 Windows 包不能混用。
+
+## 使用方式
+
+1. 在接收端选择“接收端”，设置监听端口并启动监听。
+2. 在发送端选择“发送端”，填写接收端局域网 IP 和端口并连接。
+3. 连接成功后，复制文本、图片或文件即可传输。
+4. 若启用微信消息监控，在 Win7 端保持微信登录并运行；Win10/11 端保持 ClipShare 连接即可接收通知。
+
+发送端在接收端暂时离线时会自动重试。两端应使用本项目的同一版本或兼容版本，并确保防火墙允许配置端口的 TCP 连接。
 
 ## 开发环境
 
 - Node.js 20+
 - Rust stable toolchain
-- Windows 开发需要 Visual Studio 2022 C++ 桌面开发工具
-- Windows 运行和打包需要 WebView2 相关运行时
+- Windows 构建需要 Visual Studio 2022 C++ 桌面开发工具
+- Windows 运行和打包需要 WebView2 相关运行环境
 
 安装依赖：
 
@@ -55,80 +82,52 @@ npm install
 npm run tauri dev
 ```
 
-## 本地构建
+## 本地构建与测试
 
-构建前端：
+前端构建：
 
 ```bash
 npm run build
 ```
 
-构建默认 Tauri 包：
+默认 Tauri 构建：
 
 ```bash
 npm run tauri build
 ```
 
-构建现代 Windows 包：
+Windows 10/11 构建：
 
 ```bash
 npm run tauri build -- --config src-tauri/tauri.modern.conf.json
 ```
 
-Win7 包需要 nightly Rust、`rust-src` 和官方 Win7 target 的 `build-std`：
+Win7 构建需要 nightly Rust、`rust-src` 和 Win7 target：
 
-```bash
-rustup toolchain install nightly --profile minimal --component rust-src
-$env:RUSTUP_TOOLCHAIN = "nightly"
+```powershell
+rustup toolchain install nightly-2026-07-22 --profile minimal --component rust-src
+$env:RUSTUP_TOOLCHAIN = "nightly-2026-07-22"
 npm run build
-cargo build --manifest-path src-tauri/Cargo.toml --release --target x86_64-win7-windows-msvc --bin clipshare
+cargo build --manifest-path src-tauri/Cargo.toml --release --target x86_64-win7-windows-msvc --bin clipshare --features win7-compat
 ```
 
-现代 Windows 构建产物位于 `src-tauri/target/release/bundle/`；Win7 构建产物为 `src-tauri/target/x86_64-win7-windows-msvc/release/clipshare.exe`。
-
-## 测试
-
-运行 Rust 单元测试和网络测试：
+运行 Rust 测试：
 
 ```bash
-cd src-tauri
-cargo test --lib
+cargo test --manifest-path src-tauri/Cargo.toml --lib
 ```
 
-检查前端类型并构建：
+## GitHub Actions
 
-```bash
-npm run build
-```
-
-## GitHub Actions 和下载
-
-推送 `v*` tag 会触发多平台构建，并自动创建 Draft Release。构建产物包括：
-
-- `clipshare-win7-x64`
-- `clipshare-windows-x64`
-- `clipshare-macos-x64`
-- `clipshare-macos-arm64`
-- `clipshare-linux-x64`
-
-正式安装包请从 GitHub 的 [Releases](https://github.com/JOJO-5/clipshare/releases) 下载；Actions artifact 仅作为短期构建结果保留。
-
-## 使用方式
-
-1. 设备 A 选择“接收端”，设置监听端口并开始监听。
-2. 设备 B 选择“发送端”，填写设备 A 的局域网 IP 和端口，然后连接。
-3. 连接成功后，复制文本、图片或文件即可传输。
-4. 启用微信消息提示后，Win7 端检测到微信新消息会发送到监听端，Win10/11 端显示通知。
-
-默认端口为 `9527`。成功执行一次“开始监听”或“连接设备”后，当前角色、IP 和端口会自动保存；后续启动时接收端自动监听、发送端自动连接。如果接收端尚未启动，发送端会保持重试。使用局域网 IP 连接时，请确保防火墙允许该端口的 TCP 入站连接。
+推送 `v*` 标签会触发 Windows 7、Windows 10/11、macOS Intel、macOS Apple Silicon 和 Linux 多平台构建，并自动创建正式 GitHub Release。构建产物会统一整理到 Release 页面，Actions 临时 artifact 仅保留较短时间。
 
 ## 项目结构
 
 ```text
-src/                         React 界面、配置和日志展示
-src-tauri/src/               Rust 命令、剪贴板、TCP 协议和微信监听
-src-tauri/tauri.conf.json    默认 Tauri 窗口和打包配置
-src-tauri/tauri.win7.conf.json   Win7 flavor 配置
-src-tauri/tauri.modern.conf.json Win10/11 flavor 配置
-.github/workflows/           多平台构建和 Release 工作流
+src/                              React 界面、配置和日志展示
+src-tauri/src/                    Rust 命令、剪切板、网络协议和微信监控
+src-tauri/tauri.win7.conf.json    Windows 7 构建配置
+src-tauri/tauri.modern.conf.json  Windows 10/11 构建配置
+.github/workflows/build.yml       多平台构建和 Release 工作流
+tests/                            Win7、功能回归和构建配置检查
 ```
