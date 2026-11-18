@@ -8,6 +8,9 @@ pub mod protocol;
 pub mod wechat;
 pub mod wechat_monitor;
 
+#[cfg(all(windows, feature = "win7-compat"))]
+mod win7_webview;
+
 use commands::*;
 use tauri::{
     Manager,
@@ -19,6 +22,13 @@ use tauri::{
 use crate::config::AppConfig;
 
 pub fn run() {
+    let context = tauri::generate_context!();
+    #[cfg(all(windows, feature = "win7-compat"))]
+    if let Err(error) = win7_webview::check_fixed_runtime(context.config()) {
+        win7_webview::show_error(&error);
+        std::process::exit(1);
+    }
+
     let minimize_to_tray = AppConfig::load().minimize_to_tray;
     let start_minimized = std::env::args().any(|argument| argument == "--minimized");
 
@@ -114,6 +124,6 @@ pub fn run() {
             }
             _ => {}
         })
-        .run(tauri::generate_context!())
+        .run(context)
         .expect("error while running tauri application");
 }

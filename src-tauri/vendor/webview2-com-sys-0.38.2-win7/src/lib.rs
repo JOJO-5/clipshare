@@ -37,6 +37,9 @@ pub mod Microsoft {
 
 pub mod declared_interfaces;
 
+#[cfg(clipshare_win7_loader)]
+mod win7_loader;
+
 #[cfg(test)]
 mod test {
     use windows_core::w;

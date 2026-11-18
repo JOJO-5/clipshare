@@ -8,5 +8,10 @@ is absent on some Windows 7 installations. Its SHA-256 is
 `76314119685BBF4C2B2423A44E81B57BEADC914C943D0E772FD6BC78C8E6B0E8`.
 `WEBVIEW2_LOADER_LICENSE.txt` contains Microsoft's redistribution terms.
 
+For the Win7 target, the build redirects the pinned loader's `LoadLibraryExW`
+imports to a shim. When Windows rejects `LOAD_LIBRARY_SEARCH_SYSTEM32`, the
+shim retries the loader's `version.dll` and `shell32.dll` calls using their
+absolute system directory paths.
+
 ## Getting Started
 This crate has a friendlier wrapper in [webview2-com](https://crates.io/crates/webview2-com).
