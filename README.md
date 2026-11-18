@@ -2,7 +2,7 @@
 
 ## Tray and startup
 
-- The configuration page can hide the window to the tray when it is closed or minimized.
+- The settings tab can hide the window to the tray when it is closed or minimized.
 - The tray menu restores the main window or exits ClipShare.
 - “Autostart” uses the current user's Windows Run entry and launches with `--minimized`.
 - The Win7 flavor pins `uiautomation = 0.23.0` so the executable does not import the missing `combase.dll`.
@@ -115,12 +115,12 @@ npm run build
 
 ## 使用方式
 
-1. 设备 A 选择“接收端”，设置监听端口并开始监听。
-2. 设备 B 选择“发送端”，填写设备 A 的局域网 IP 和端口，然后连接。
-3. 连接成功后，复制文本、图片或文件即可传输。
-4. 启用微信消息提示后，Win7 端检测到微信新消息会发送到监听端，Win10/11 端显示通知。
+1. 设备 A 选择「等待另一台连接」，开始等待后点击「复制地址」。
+2. 设备 B 选择「连接另一台」，粘贴设备 A 的地址，再点击「连接设备」。
+3. 看到「已连接 · 双向同步中」后，两台设备都可以复制文本、图片或文件来同步。
+4. 在运行微信的设备上，从「设置」开启「监听本机微信」。在接收通知的设备上可设置预览上限及全文显示。
 
-默认端口为 `9527`。成功执行一次“开始监听”或“连接设备”后，当前角色、IP 和端口会自动保存；后续启动时接收端自动监听、发送端自动连接。如果接收端尚未启动，发送端会保持重试。使用局域网 IP 连接时，请确保防火墙允许该端口的 TCP 入站连接。
+默认端口为 `9527`。「开始等待」或「连接设备」会保存角色和地址，ClipShare 下次启动时会自动恢复。如果另一台尚未启动，主动连接的一端会自动重试。防火墙需允许等待端端口的 TCP 入站连接。
 
 ## 项目结构
 

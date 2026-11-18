@@ -1,7 +1,7 @@
 $ErrorActionPreference = 'Stop'
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
-$configPanel = Get-Content -LiteralPath (Join-Path $repoRoot 'src\components\ConfigPanel.tsx') -Raw
+$settingsPanel = Get-Content -LiteralPath (Join-Path $repoRoot 'src\components\SettingsPanel.tsx') -Raw
 $commands = Get-Content -LiteralPath (Join-Path $repoRoot 'src-tauri\src\commands.rs') -Raw
 $clipboard = Get-Content -LiteralPath (Join-Path $repoRoot 'src-tauri\src\clipboard.rs') -Raw
 $network = Get-Content -LiteralPath (Join-Path $repoRoot 'src-tauri\src\network.rs') -Raw
@@ -13,8 +13,8 @@ $cargoManifest = Get-Content -LiteralPath (Join-Path $repoRoot 'src-tauri\Cargo.
 $lib = Get-Content -LiteralPath (Join-Path $repoRoot 'src-tauri\src\lib.rs') -Raw
 $config = Get-Content -LiteralPath (Join-Path $repoRoot 'src-tauri\src\config.rs') -Raw
 
-if ($configPanel -notmatch 'getFieldsValue\(true\)') {
-    throw 'Config save must include unmounted fields such as port.'
+if ($settingsPanel -notmatch "invoke<Config>\('save_preferences'" -or $commands -notmatch 'config.port = saved.port') {
+    throw 'Saving preferences must preserve the connection endpoint used at startup.'
 }
 if ($commands -notmatch 'set_files\(' -or $clipboard -notmatch 'FileList[\s\S]*write_clipboard') {
     throw 'Received files must be written back as a Windows file-list clipboard payload.'

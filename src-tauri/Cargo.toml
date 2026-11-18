@@ -19,6 +19,7 @@ dirs = "6"
 flate2 = "1"
 clipboard-win = "5"
 arboard = "3"
+if-addrs = "0.13.4"
 tauri-plugin-notification = { version = "^2.0.0", features = ["windows7-compat"] }
 
 [target.'cfg(windows)'.dependencies]

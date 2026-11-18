@@ -2,11 +2,12 @@ use crate::autostart::set_autostart;
 use crate::clipboard::{ClipboardContent, ClipboardListener, ClipboardSuppression};
 use crate::config::{AppConfig, StartupConnection};
 use crate::logger::LogEntry;
-use crate::network::ConnectionStatus;
+use crate::network::{ConnectionSnapshot, ConnectionStatus};
 use crate::network::NetworkManager;
 use crate::protocol::*;
 use crate::wechat_monitor::{MessageTracker, WeChatMonitor};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 use tauri::{command, Emitter, Manager, State};
@@ -104,6 +105,7 @@ pub struct AppState {
     pub logs: Arc<Mutex<Vec<LogEntry>>>,
     pub clipboard_listener: Mutex<Option<ClipboardListener>>,
     pub clipboard_suppression: Arc<ClipboardSuppression>,
+    pub minimize_to_tray: AtomicBool,
     pub wechat_monitor: Mutex<Option<WeChatMonitor>>,
     pub wechat_tracker: Arc<Mutex<MessageTracker>>,
 }
@@ -115,6 +117,7 @@ impl Default for AppState {
             logs: Arc::new(Mutex::new(Vec::new())),
             clipboard_listener: Mutex::new(None),
             clipboard_suppression: Arc::new(ClipboardSuppression::new()),
+            minimize_to_tray: AtomicBool::new(AppConfig::load().minimize_to_tray),
             wechat_monitor: Mutex::new(None),
             wechat_tracker: Arc::new(Mutex::new(MessageTracker::with_pending(
                 load_pending_wechat_messages(),
@@ -136,7 +139,24 @@ pub fn save_config(
 ) -> Result<(), String> {
     set_autostart(config.autostart)?;
     config.save()?;
+    state.minimize_to_tray.store(config.minimize_to_tray, Ordering::Relaxed);
     restart_wechat_monitor(window, state.inner(), config)
+}
+
+#[command]
+pub fn save_preferences(
+    mut config: AppConfig,
+    window: tauri::Window,
+    state: State<AppState>,
+) -> Result<AppConfig, String> {
+    let saved = AppConfig::load();
+    config.role = saved.role;
+    config.port = saved.port;
+    config.target_ip = saved.target_ip;
+    config.target_port = saved.target_port;
+    config.max_file_size = saved.max_file_size;
+    save_config(config.clone(), window, state)?;
+    Ok(config)
 }
 
 #[command]
@@ -167,6 +187,34 @@ pub fn get_connection_status(state: State<AppState>) -> String {
         ConnectionStatus::Connecting => "connecting".to_string(),
         ConnectionStatus::Disconnected => "disconnected".to_string(),
     }
+}
+
+#[command]
+pub fn get_connection_info(state: State<AppState>) -> ConnectionSnapshot {
+    state.network.lock().unwrap().connection_snapshot()
+}
+
+#[command]
+pub fn get_local_addresses() -> Result<Vec<std::net::Ipv4Addr>, String> {
+    let mut addresses: Vec<_> = if_addrs::get_if_addrs()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .filter_map(|interface| match interface.ip() {
+            std::net::IpAddr::V4(ip) if !ip.is_loopback() && !ip.is_unspecified() => Some(ip),
+            _ => None,
+        })
+        .collect();
+    addresses.sort_unstable_by_key(|ip| (ip.is_link_local(), !ip.is_private(), *ip));
+    addresses.dedup();
+    Ok(addresses)
+}
+
+#[command]
+pub fn copy_local_text(text: String, state: State<AppState>) -> Result<(), String> {
+    let content = ClipboardContent::Text(text.clone());
+    apply_received_clipboard(&state.clipboard_suppression, &content, || {
+        crate::clipboard::set_text(&text)
+    })
 }
 
 #[command]

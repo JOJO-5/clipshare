@@ -1,11 +1,14 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { isPermissionGranted, onAction, requestPermission, sendNotification } from '@tauri-apps/plugin-notification'
-import { Badge, Modal, Tabs, Typography, notification } from 'antd'
+import { Button, Modal, Tabs, notification } from 'antd'
 import { ConfigPanel } from './components/ConfigPanel'
-import { LogPanel } from './components/LogPanel'
+import { formatLogTime, LogPanel } from './components/LogPanel'
 import type { LogEntry } from './components/LogPanel'
+import { SettingsPanel } from './components/SettingsPanel'
+import { StatusIndicator } from './components/StatusIndicator'
+import { errorText, type Config, type ConnectionSnapshot } from './connection'
 
 interface WeChatMessage {
   id: string
@@ -16,12 +19,19 @@ interface WeChatMessage {
   unread_count: number
 }
 
-const { Title } = Typography
 const WECHAT_NOTIFICATION_DEDUP_WINDOW_MS = 30_000
 const WECHAT_NATIVE_NOTIFICATION_COOLDOWN_MS = 30_000
 
 function truncatePreview(content: string, limit = 40) {
-  return content.length <= limit ? content : `${Array.from(content).slice(0, limit).join('')}…`
+  if (content.length <= limit) return content
+  let preview = ''
+  let length = 0
+  for (const character of content) {
+    if (length === limit) return `${preview}…`
+    preview += character
+    length++
+  }
+  return content
 }
 
 function wechatNotificationKey(message: WeChatMessage) {
@@ -46,14 +56,29 @@ function combineWechatMessages(messages: WeChatMessage[]) {
   if (messages.length === 1) return latest
   return {
     ...latest,
+    preview: messages.map(message => message.preview).join('\n\n'),
     content: messages
       .map((message, index) => `[${index + 1}] ${message.content}`)
       .join('\n\n'),
   }
 }
 
+function latestClipboardTransfer(logs: LogEntry[]) {
+  const kinds: Record<string, string> = { text: '文本', image: '图片', file: '文件' }
+  for (let index = logs.length - 1; index >= 0; index--) {
+    const entry = logs[index]
+    const kind = kinds[entry.dataType]
+    if (kind && (entry.type === 'send' || entry.type === 'recv')) {
+      return `最近${entry.type === 'send' ? '发送' : '接收'}${kind} · ${formatLogTime(entry.time)}`
+    }
+  }
+}
+
 function App() {
-  const [activeTab, setActiveTab] = useState('config')
+  const [config, setConfig] = useState<Config | null>(null)
+  const [configError, setConfigError] = useState('')
+  const [connection, setConnection] = useState<ConnectionSnapshot | null>(null)
+  const [connectionError, setConnectionError] = useState(false)
   const [logs, setLogs] = useState<LogEntry[]>([])
   const [selectedWeChat, setSelectedWeChat] = useState<WeChatMessage | null>(null)
   const [notificationApi, notificationContextHolder] = notification.useNotification()
@@ -61,6 +86,42 @@ function App() {
   const wechatNotificationKeys = useRef(new Map<string, number>())
   const wechatNotificationGroups = useRef(new Map<string, WeChatMessage[]>())
   const wechatNativeNotificationTimes = useRef(new Map<string, number>())
+  const currentConfig = useRef<Config | null>(null)
+  const connectionRequest = useRef(0)
+
+  const updateConfig = useCallback((value: Config) => {
+    currentConfig.current = value
+    setConfig(value)
+  }, [])
+
+  const loadConfig = useCallback(async () => {
+    setConfigError('')
+    try {
+      updateConfig(await invoke<Config>('get_config'))
+    } catch (error) {
+      setConfigError('读取设置失败。' + errorText(error))
+    }
+  }, [updateConfig])
+
+  const refreshConnection = useCallback(async () => {
+    const request = ++connectionRequest.current
+    try {
+      const info = await invoke<ConnectionSnapshot>('get_connection_info')
+      if (request !== connectionRequest.current) return
+      setConnection(info)
+      setConnectionError(false)
+    } catch {
+      if (request !== connectionRequest.current) return
+      setConnection(null)
+      setConnectionError(true)
+    }
+  }, [])
+
+  useEffect(() => {
+    void loadConfig()
+    void refreshConnection()
+    return () => { connectionRequest.current++ }
+  }, [loadConfig, refreshConnection])
 
   useEffect(() => {
     let disposed = false
@@ -81,6 +142,7 @@ function App() {
       } catch {
         permissionGranted = false
       }
+      if (disposed) return
       appendLog({
         time: new Date().toISOString(),
         type: 'info',
@@ -108,6 +170,10 @@ function App() {
       } catch {
         stopNotificationAction = undefined
       }
+      if (disposed) {
+        stopNotificationAction?.()
+        return
+      }
 
       const [changed, received, wechat, wechatMonitorLog, clipboardMonitorLog, networkStatusLog] = await Promise.all([
         listen<LogEntry>('clipboard-changed', event => appendLog(event.payload)),
@@ -115,7 +181,12 @@ function App() {
           if (event.payload.dataType !== 'wechat') appendLog(event.payload)
         }),
         listen<WeChatMessage>('wechat-received', event => {
-          wechatMessages.current.set(event.payload.id, event.payload)
+          const preview = truncatePreview(
+            event.payload.preview || event.payload.content,
+            currentConfig.current?.wechat_preview_limit ?? 40,
+          )
+          const receivedMessage = { ...event.payload, preview }
+          wechatMessages.current.set(receivedMessage.id, receivedMessage)
           const notificationKey = wechatNotificationKey(event.payload)
           const now = Date.now()
           for (const [key, timestamp] of wechatNotificationKeys.current) {
@@ -129,7 +200,6 @@ function App() {
           wechatNotificationKeys.current.set(notificationKey, now)
           if (isDuplicate) return
 
-          const preview = truncatePreview(event.payload.preview || event.payload.content)
           const groupKey = wechatNotificationGroup(event.payload)
           const shouldSendNativeNotification = shouldSendNativeWechatNotification(
             wechatNativeNotificationTimes.current.get(groupKey),
@@ -137,7 +207,7 @@ function App() {
           )
           const groupedMessages = [
             ...(wechatNotificationGroups.current.get(groupKey) ?? []),
-            event.payload,
+            receivedMessage,
           ].slice(-50)
           const groupedCount = groupedMessages.length
           wechatNotificationGroups.current.set(groupKey, groupedMessages)
@@ -149,21 +219,27 @@ function App() {
             type: 'recv',
             dataType: 'wechat',
             content: `${event.payload.sender}: ${preview}`,
-            size: event.payload.content.length,
+            size: 0,
           })
+          const openMessage = () => {
+            const messages = wechatNotificationGroups.current.get(groupKey) ?? [receivedMessage]
+            wechatNotificationGroups.current.delete(groupKey)
+            wechatNativeNotificationTimes.current.delete(groupKey)
+            notificationApi.destroy(groupKey)
+            setSelectedWeChat(combineWechatMessages(messages))
+          }
           notificationApi.open({
             key: groupKey,
             message: `微信消息 · ${event.payload.sender}`,
             description: groupedDescription,
             placement: 'bottomRight',
             duration: 0,
-            onClick: () => {
-              const messages = wechatNotificationGroups.current.get(groupKey) ?? [event.payload]
-              wechatNotificationGroups.current.delete(groupKey)
-              wechatNativeNotificationTimes.current.delete(groupKey)
-              notificationApi.destroy(groupKey)
-              setSelectedWeChat(combineWechatMessages(messages))
-            },
+            onClick: openMessage,
+            actions: (
+              <Button size="small" onClick={event => { event.stopPropagation(); openMessage() }}>
+                查看消息
+              </Button>
+            ),
           })
           if (permissionGranted && shouldSendNativeNotification) {
             wechatNativeNotificationTimes.current.set(groupKey, now)
@@ -195,7 +271,10 @@ function App() {
         }),
         listen<LogEntry>('wechat-monitor-log', event => appendLog(event.payload)),
         listen<LogEntry>('clipboard-monitor-log', event => appendLog(event.payload)),
-        listen<LogEntry>('network-status-log', event => appendLog(event.payload)),
+        listen<LogEntry>('network-status-log', event => {
+          appendLog(event.payload)
+          void refreshConnection()
+        }),
       ])
       if (disposed) {
         changed()
@@ -212,6 +291,7 @@ function App() {
       stopWeChatMonitorLog = wechatMonitorLog
       stopClipboardMonitorLog = clipboardMonitorLog
       stopNetworkStatusLog = networkStatusLog
+      void refreshConnection()
 
       try {
         const initialLogs = await invoke<LogEntry[]>('get_logs')
@@ -241,12 +321,20 @@ function App() {
       stopNetworkStatusLog?.()
       stopNotificationAction?.()
     }
-  }, [notificationApi])
+  }, [notificationApi, refreshConnection])
 
   const clearLogs = async () => {
+    const visible = new Set(logs)
     await invoke('clear_logs')
-    setLogs([])
+    setLogs(current => current.filter(entry => !visible.has(entry)))
   }
+
+  const configPlaceholder = configError ? (
+    <div className="loading-panel">
+      <p role="alert">{configError}</p>
+      <Button onClick={() => void loadConfig()}>重试</Button>
+    </div>
+  ) : <p role="status" className="loading-panel">正在读取设置…</p>
 
   return (
     <div className="app-shell">
@@ -257,26 +345,32 @@ function App() {
         footer={null}
         onCancel={() => setSelectedWeChat(null)}
       >
-        <p style={{ whiteSpace: 'pre-wrap', marginBottom: 0 }}>{selectedWeChat?.content}</p>
+        <p className="wechat-detail">
+          {config?.wechat_show_content ? selectedWeChat?.content : selectedWeChat?.preview}
+        </p>
+        {!config?.wechat_show_content && <p className="hint">当前仅显示通知预览，可在「设置」中更改。</p>}
       </Modal>
       <header className="app-header">
-        <div>
-          <div className="eyebrow">LOCAL NETWORK · CLIPBOARD SYNC</div>
-          <Title level={3} className="app-title">ClipShare</Title>
+        <h1>ClipShare</h1>
+        <div className="header-status">
+          <StatusIndicator connection={connection} error={connectionError} />
+          {connectionError && <Button size="small" onClick={() => void refreshConnection()}>重试</Button>}
         </div>
-        <Badge status="processing" text={<span className="header-status">服务已就绪</span>} />
       </header>
-      <div className="app-content">
+      <main className="app-content">
         <Tabs
           className="main-tabs"
-          activeKey={activeTab}
-          onChange={setActiveTab}
           items={[
-            { key: 'config', label: '连接配置', children: <ConfigPanel /> },
-            { key: 'log', label: '传输日志', children: <LogPanel logs={logs} onClear={clearLogs} /> },
+            {
+              key: 'config', label: '设备连接', children: config ? (
+                <ConfigPanel config={config} connection={connection} lastTransfer={latestClipboardTransfer(logs)} onConnectionChange={refreshConnection} />
+              ) : configPlaceholder,
+            },
+            { key: 'log', label: '传输记录', children: <LogPanel logs={logs} onClear={clearLogs} /> },
+            { key: 'settings', label: '设置', children: config ? <SettingsPanel config={config} onChange={updateConfig} /> : configPlaceholder },
           ]}
         />
-      </div>
+      </main>
     </div>
   )
 }

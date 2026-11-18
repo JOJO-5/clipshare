@@ -12,6 +12,7 @@ pub mod wechat_monitor;
 mod win7_webview;
 
 use commands::*;
+use std::sync::atomic::Ordering;
 use tauri::{
     Manager,
     WindowEvent,
@@ -19,7 +20,6 @@ use tauri::{
     tray::{TrayIconBuilder, MouseButton, MouseButtonState},
     image::Image,
 };
-use crate::config::AppConfig;
 
 pub fn run() {
     let context = tauri::generate_context!();
@@ -29,7 +29,6 @@ pub fn run() {
         std::process::exit(1);
     }
 
-    let minimize_to_tray = AppConfig::load().minimize_to_tray;
     let start_minimized = std::env::args().any(|argument| argument == "--minimized");
 
     #[cfg(not(feature = "win7-compat"))]
@@ -42,7 +41,11 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_config,
             save_config,
+            save_preferences,
             get_connection_status,
+            get_connection_info,
+            get_local_addresses,
+            copy_local_text,
             start_server,
             connect_to_server,
             disconnect,
@@ -112,17 +115,20 @@ pub fn run() {
 
             Ok(())
         })
-        .on_window_event(move |window, event| match event {
-            WindowEvent::CloseRequested { api, .. } if minimize_to_tray => {
-                api.prevent_close();
-                let _ = window.hide();
+        .on_window_event(|window, event| {
+            if !window.state::<AppState>().minimize_to_tray.load(Ordering::Relaxed) {
+                return;
             }
-            WindowEvent::Resized(_) if minimize_to_tray => {
-                if window.is_minimized().unwrap_or(false) {
+            match event {
+                WindowEvent::CloseRequested { api, .. } => {
+                    api.prevent_close();
                     let _ = window.hide();
                 }
+                WindowEvent::Resized(_) if window.is_minimized().unwrap_or(false) => {
+                    let _ = window.hide();
+                }
+                _ => {}
             }
-            _ => {}
         })
         .run(context)
         .expect("error while running tauri application");

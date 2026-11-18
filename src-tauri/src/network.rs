@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
-use std::net::{Shutdown, TcpListener, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, Shutdown, TcpListener, TcpStream, ToSocketAddrs};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -8,6 +8,7 @@ use std::thread;
 use std::time::Duration;
 
 use crate::protocol::*;
+use serde::Serialize;
 
 const MAX_MESSAGE_SIZE: usize = 100 * 1024 * 1024;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
@@ -30,11 +31,29 @@ const HEARTBEAT_TIMEOUT: Duration = Duration::from_millis(350);
 const MESSAGE_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 use crate::config::AppConfig;
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ConnectionStatus {
     Disconnected,
     Connecting,
     Connected,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "role", rename_all = "lowercase")]
+pub enum ConnectionEndpoint {
+    Server { port: u16 },
+    Client { address: String },
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ConnectionSnapshot {
+    pub status: ConnectionStatus,
+    pub endpoint: Option<ConnectionEndpoint>,
+    pub peer: Option<IpAddr>,
+    pub reason: &'static str,
+    #[serde(skip)]
+    session_id: u64,
 }
 
 type ReceiveHandler = Arc<dyn Fn(Vec<u8>, u8) -> Result<(), String> + Send + Sync + 'static>;
@@ -86,7 +105,7 @@ struct ClientTarget {
 }
 
 pub struct NetworkManager {
-    pub status: Arc<Mutex<ConnectionStatus>>,
+    status: Arc<Mutex<ConnectionSnapshot>>,
     sender: Arc<Mutex<Option<TcpStream>>>,
     receiver: Arc<Mutex<Option<TcpStream>>>,
     config: Arc<Mutex<AppConfig>>,
@@ -100,7 +119,13 @@ pub struct NetworkManager {
 impl NetworkManager {
     pub fn new() -> Self {
         Self {
-            status: Arc::new(Mutex::new(ConnectionStatus::Disconnected)),
+            status: Arc::new(Mutex::new(ConnectionSnapshot {
+                status: ConnectionStatus::Disconnected,
+                endpoint: None,
+                peer: None,
+                reason: "idle",
+                session_id: 0,
+            })),
             sender: Arc::new(Mutex::new(None)),
             receiver: Arc::new(Mutex::new(None)),
             config: Arc::new(Mutex::new(AppConfig::load())),
@@ -117,7 +142,11 @@ impl NetworkManager {
     }
 
     pub fn get_status(&self) -> ConnectionStatus {
-        *self.status.lock().unwrap()
+        self.status.lock().unwrap().status
+    }
+
+    pub fn connection_snapshot(&self) -> ConnectionSnapshot {
+        self.status.lock().unwrap().clone()
     }
 
     pub fn set_status_handler<F>(&self, handler: F)
@@ -128,15 +157,22 @@ impl NetworkManager {
     }
 
     fn transition_status(
-        status: &Arc<Mutex<ConnectionStatus>>,
+        status: &Mutex<ConnectionSnapshot>,
         status_handler: &Arc<Mutex<Option<StatusHandler>>>,
+        session_id: u64,
         next: ConnectionStatus,
-        reason: &str,
+        reason: &'static str,
+        peer: Option<IpAddr>,
     ) {
         let changed = match status.lock() {
-            Ok(mut current) if *current != next => {
-                *current = next;
-                true
+            Ok(mut current) if current.session_id == session_id => {
+                // Starting from an already idle session should not publish a disconnect event.
+                let changed = current.status != next || current.peer != peer
+                    || (current.reason != reason && reason != "manual disconnect");
+                current.status = next;
+                current.reason = reason;
+                current.peer = peer;
+                changed
             }
             _ => false,
         };
@@ -153,6 +189,14 @@ impl NetworkManager {
         }
     }
 
+    fn replace_session(&self, endpoint: Option<ConnectionEndpoint>) -> u64 {
+        let mut current = self.status.lock().unwrap();
+        let session_id = self.session.fetch_add(1, Ordering::SeqCst) + 1;
+        current.session_id = session_id;
+        current.endpoint = endpoint;
+        session_id
+    }
+
     fn close_streams(&self) {
         if let Ok(mut s) = self.sender.lock() {
             if let Some(stream) = s.take() {
@@ -167,14 +211,16 @@ impl NetworkManager {
     }
 
     fn stop_current_session(&self) {
-        self.session.fetch_add(1, Ordering::SeqCst);
+        let session_id = self.replace_session(None);
         self.fail_ack_waiters();
         self.close_streams();
         Self::transition_status(
             &self.status,
             &self.status_handler,
+            session_id,
             ConnectionStatus::Disconnected,
             "manual disconnect",
+            None,
         );
     }
 
@@ -207,7 +253,7 @@ impl NetworkManager {
     }
 
     fn status_after_connection_loss(&self) -> ConnectionStatus {
-        if self.client_target.lock().unwrap().is_some() {
+        if self.status.lock().unwrap().endpoint.is_some() {
             ConnectionStatus::Connecting
         } else {
             ConnectionStatus::Disconnected
@@ -379,7 +425,7 @@ impl NetworkManager {
 
     fn spawn_heartbeat(
         sender: Arc<Mutex<Option<TcpStream>>>,
-        status: Arc<Mutex<ConnectionStatus>>,
+        status: Arc<Mutex<ConnectionSnapshot>>,
         status_handler: Arc<Mutex<Option<StatusHandler>>>,
         session: Arc<AtomicU64>,
         session_id: u64,
@@ -414,8 +460,10 @@ impl NetworkManager {
                     Self::transition_status(
                         &status,
                         &status_handler,
+                        session_id,
                         ConnectionStatus::Connecting,
                         "heartbeat send failed; retrying",
+                        None,
                     );
                 }
                 return;
@@ -444,13 +492,7 @@ impl NetworkManager {
         R: ReceiveOutcome,
     {
         self.disconnect();
-        Self::transition_status(
-            &self.status,
-            &self.status_handler,
-            ConnectionStatus::Connecting,
-            "server listening",
-        );
-        let session_id = self.session.fetch_add(1, Ordering::SeqCst) + 1;
+        let session_id = self.replace_session(Some(ConnectionEndpoint::Server { port }));
         let on_receive: ReceiveHandler =
             Arc::new(move |data, msg_type| on_receive(data, msg_type).into_receive_result());
 
@@ -461,8 +503,10 @@ impl NetworkManager {
                 Self::transition_status(
                     &self.status,
                     &self.status_handler,
+                    session_id,
                     ConnectionStatus::Disconnected,
                     "server bind failed",
+                    None,
                 );
                 return Err(error.to_string());
             }
@@ -471,11 +515,21 @@ impl NetworkManager {
             Self::transition_status(
                 &self.status,
                 &self.status_handler,
+                session_id,
                 ConnectionStatus::Disconnected,
                 "server listener setup failed",
+                None,
             );
             return Err(error.to_string());
         }
+        Self::transition_status(
+            &self.status,
+            &self.status_handler,
+            session_id,
+            ConnectionStatus::Connecting,
+            "server listening",
+            None,
+        );
 
         let sender = self.sender.clone();
         let receiver = self.receiver.clone();
@@ -490,7 +544,7 @@ impl NetworkManager {
             }
 
             match listener.accept() {
-                Ok((mut stream, _)) => {
+                Ok((mut stream, peer)) => {
                     if Self::configure_connected_stream(&stream).is_err() {
                         continue;
                     }
@@ -505,13 +559,18 @@ impl NetworkManager {
                         Ok(stream) => stream,
                         Err(_) => return,
                     };
+                    if session.load(Ordering::SeqCst) != session_id {
+                        return;
+                    }
                     *sender.lock().unwrap() = Some(send_stream);
                     *receiver.lock().unwrap() = Some(close_stream);
                     Self::transition_status(
                         &status,
                         &status_handler,
+                        session_id,
                         ConnectionStatus::Connected,
                         "peer accepted and acknowledged",
+                        Some(peer.ip()),
                     );
                     let heartbeat_stop = Arc::new(AtomicBool::new(false));
                     Self::spawn_heartbeat(
@@ -540,8 +599,10 @@ impl NetworkManager {
                     Self::transition_status(
                         &status,
                         &status_handler,
+                        session_id,
                         ConnectionStatus::Connecting,
                         connection_end.reason(),
+                        None,
                     );
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -552,8 +613,10 @@ impl NetworkManager {
                         Self::transition_status(
                             &status,
                             &status_handler,
+                            session_id,
                             ConnectionStatus::Disconnected,
                             "server listener failed",
+                            None,
                         );
                     }
                     return;
@@ -570,13 +633,17 @@ impl NetworkManager {
         R: ReceiveOutcome,
     {
         self.disconnect();
+        let session_id = self.replace_session(Some(ConnectionEndpoint::Client {
+            address: format!("{ip}:{port}"),
+        }));
         Self::transition_status(
             &self.status,
             &self.status_handler,
+            session_id,
             ConnectionStatus::Connecting,
             "connecting to peer",
+            None,
         );
-        let session_id = self.session.fetch_add(1, Ordering::SeqCst) + 1;
         let target = ClientTarget {
             ip: ip.to_string(),
             port,
@@ -611,8 +678,10 @@ impl NetworkManager {
                             Self::transition_status(
                                 &status,
                                 &status_handler,
+                                session_id,
                                 ConnectionStatus::Connecting,
                                 "protocol acknowledgement failed; retrying",
+                                None,
                             );
                             continue;
                         }
@@ -624,13 +693,19 @@ impl NetworkManager {
                             Ok(stream) => stream,
                             Err(_) => continue,
                         };
+                        if session.load(Ordering::SeqCst) != session_id {
+                            return;
+                        }
+                        let peer = stream.peer_addr().ok().map(|address| address.ip());
                         *sender.lock().unwrap() = Some(send_stream);
                         *receiver.lock().unwrap() = Some(close_stream);
                         Self::transition_status(
                             &status,
                             &status_handler,
+                            session_id,
                             ConnectionStatus::Connected,
                             "protocol ack received",
+                            peer,
                         );
                         retry_delay = Duration::from_millis(250);
                         let heartbeat_stop = Arc::new(AtomicBool::new(false));
@@ -661,16 +736,20 @@ impl NetworkManager {
                         Self::transition_status(
                             &status,
                             &status_handler,
+                            session_id,
                             ConnectionStatus::Connecting,
                             connection_end.reason(),
+                            None,
                         );
                     }
                     Err(_) => {
                         Self::transition_status(
                             &status,
                             &status_handler,
+                            session_id,
                             ConnectionStatus::Connecting,
                             "connect failed; retrying",
+                            None,
                         );
                     }
                 }
@@ -699,6 +778,7 @@ impl NetworkManager {
         if data.len() > MAX_MESSAGE_SIZE {
             return Err("Message exceeds the 100 MB transfer limit".to_string());
         }
+        let session_id = self.session.load(Ordering::SeqCst);
         let result = {
             let mut sender = self.sender.lock().unwrap();
             if let Some(ref mut stream) = *sender {
@@ -713,14 +793,16 @@ impl NetworkManager {
             }
         };
 
-        if result.is_err() {
+        if result.is_err() && self.session.load(Ordering::SeqCst) == session_id {
             self.close_streams();
             self.fail_ack_waiters();
             Self::transition_status(
                 &self.status,
                 &self.status_handler,
+                session_id,
                 self.status_after_connection_loss(),
                 "send failed; retrying",
+                None,
             );
         }
         result
@@ -740,6 +822,7 @@ impl NetworkManager {
     }
 
     fn send_with_ack(&self, msg_type: u8, data: &[u8]) -> Result<(), String> {
+        let session_id = self.session.load(Ordering::SeqCst);
         let sequence = self.next_message_sequence();
         let waiter: AckWaiter = Arc::new((Mutex::new(None), Condvar::new()));
         self.ack_waiters
@@ -771,8 +854,6 @@ impl NetworkManager {
             return Ok(());
         }
 
-        self.close_streams();
-        self.fail_ack_waiters();
         let (reason, error) = if completion == Some(false) {
             ("message rejected; retrying", "Peer rejected the message")
         } else {
@@ -781,12 +862,18 @@ impl NetworkManager {
                 "Peer did not acknowledge the message",
             )
         };
-        Self::transition_status(
-            &self.status,
-            &self.status_handler,
-            self.status_after_connection_loss(),
-            reason,
-        );
+        if self.session.load(Ordering::SeqCst) == session_id {
+            self.close_streams();
+            self.fail_ack_waiters();
+            Self::transition_status(
+                &self.status,
+                &self.status_handler,
+                session_id,
+                self.status_after_connection_loss(),
+                reason,
+                None,
+            );
+        }
         Err(error.to_string())
     }
 
@@ -867,6 +954,48 @@ mod tests {
         assert!(managers
             .iter()
             .all(|manager| manager.get_status() == ConnectionStatus::Connected));
+    }
+
+    #[test]
+    fn connection_snapshot_reports_listener_peer_and_disconnect() {
+        let port = available_port();
+        let server = NetworkManager::new();
+        let client = NetworkManager::new();
+        server.start_server(port, |_, _| {}).unwrap();
+        let waiting = server.connection_snapshot();
+        assert_eq!(waiting.status, ConnectionStatus::Connecting);
+        assert_eq!(waiting.endpoint, Some(ConnectionEndpoint::Server { port }));
+        assert_eq!(waiting.reason, "server listening");
+        assert_eq!(waiting.peer, None);
+
+        client.connect_to_server("127.0.0.1", port, |_, _| {}).unwrap();
+        wait_for_connected(&[&server, &client]);
+        for manager in [&server, &client] {
+            assert_eq!(manager.connection_snapshot().peer, Some("127.0.0.1".parse().unwrap()));
+        }
+        client.disconnect();
+        server.disconnect();
+        let disconnected = server.connection_snapshot();
+        assert_eq!(disconnected.status, ConnectionStatus::Disconnected);
+        assert_eq!(disconnected.endpoint, None);
+        assert_eq!(disconnected.peer, None);
+    }
+
+    #[test]
+    fn outdated_worker_does_not_overwrite_connection_snapshot() {
+        let manager = NetworkManager::new();
+        let previous = manager.replace_session(Some(ConnectionEndpoint::Server { port: 9527 }));
+        manager.disconnect();
+        NetworkManager::transition_status(
+            &manager.status,
+            &manager.status_handler,
+            previous,
+            ConnectionStatus::Connected,
+            "peer accepted and acknowledged",
+            Some("127.0.0.1".parse().unwrap()),
+        );
+        assert_eq!(manager.connection_snapshot().status, ConnectionStatus::Disconnected);
+        assert_eq!(manager.connection_snapshot().peer, None);
     }
 
     #[test]

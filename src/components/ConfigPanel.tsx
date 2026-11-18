@@ -1,172 +1,225 @@
-import { useEffect, useState } from 'react'
-import { Button, Form, Input, InputNumber, Radio, Space, Switch, message } from 'antd'
+import { useEffect, useRef, useState } from 'react'
+import { Button, Input, InputNumber, Modal, Radio, Select, type InputRef } from 'antd'
 import { invoke } from '@tauri-apps/api/core'
-import { StatusIndicator } from './StatusIndicator'
+import { DEFAULT_PORT, errorText, parseAddress, type Config, type ConnectionSnapshot } from '../connection'
 
-interface Config {
-  role: string
-  port: number
-  target_ip: string
-  target_port: number
-  max_file_size: number
-  wechat_enabled: boolean
-  wechat_preview_limit: number
-  wechat_show_content: boolean
-  wechat_session_filter: string
-  minimize_to_tray: boolean
-  autostart: boolean
+interface Props {
+  config: Config
+  connection: ConnectionSnapshot | null
+  lastTransfer: string | undefined
+  onConnectionChange: () => Promise<void>
 }
 
-export function ConfigPanel() {
-  const [form] = Form.useForm<Config>()
-  const role = Form.useWatch('role', form)
-  const [loading, setLoading] = useState(false)
-  const [status, setStatus] = useState('disconnected')
+function connectionError(error: unknown) {
+  const detail = errorText(error)
+  if (/address already in use|only one usage|10048|地址已被使用|端口.*占用/i.test(detail)) {
+    return '端口已被占用。请换一个监听端口，再重试。'
+  }
+  return '操作失败。' + detail
+}
+
+export function ConfigPanel({ config, connection, lastTransfer, onConnectionChange }: Props) {
+  const [role, setRole] = useState(config.role === 'client' ? 'client' : 'server')
+  const [address, setAddress] = useState(config.target_ip ? config.target_ip + ':' + config.target_port : '')
+  const [port, setPort] = useState<number | null>(config.port)
+  const [addresses, setAddresses] = useState<string[] | null>(null)
+  const [selectedIp, setSelectedIp] = useState('')
+  const [copiedAddress, setCopiedAddress] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  const addressInput = useRef<InputRef>(null)
+  const [modal, modalContext] = Modal.useModal()
+
+  const loadAddresses = () => invoke<string[]>('get_local_addresses').then(setAddresses).catch(() => setAddresses([]))
 
   useEffect(() => {
-    void loadConfig()
-    const interval = setInterval(() => invoke<string>('get_connection_status').then(setStatus).catch(() => {}), 2000)
-    return () => clearInterval(interval)
+    void loadAddresses()
   }, [])
 
-  const loadConfig = async () => {
+  const active = connection !== null && connection.status !== 'disconnected'
+  const endpoint = active ? connection.endpoint : null
+  const parsedAddress = parseAddress(address)
+  const target = parsedAddress ? parsedAddress.ip + ':' + parsedAddress.port : null
+  const sameEndpoint = endpoint !== null && (
+    endpoint.role === 'server' ? role === 'server' && endpoint.port === port : role === 'client' && endpoint.address === target
+  )
+  const ip = addresses?.includes(selectedIp) ? selectedIp : addresses?.[0]
+  const addressPort = endpoint?.role === 'server' ? endpoint.port : port
+  const localAddress = ip && addressPort ? ip + ':' + addressPort : ''
+  const runtimeError = !error && role === 'server' && connection?.status === 'disconnected'
+    && connection.reason === 'server bind failed'
+
+  const copyAddress = async () => {
     try {
-      const config = await invoke<Config>('get_config')
-      form.setFieldsValue(config)
-    } catch (error) {
-      console.error('Failed to load config:', error)
+      await invoke('copy_local_text', { text: localAddress })
+      setCopiedAddress(localAddress)
+      setError('')
+    } catch (cause) {
+      setError('复制失败。' + errorText(cause))
     }
   }
 
-  const handleSave = async () => {
+  const stop = async () => {
+    setBusy(true)
+    setError('')
     try {
-      // `port` is not mounted while editing client mode, but the Rust command
-      // accepts a complete AppConfig. Include the preserved form store and
-      // fill any missing legacy values before crossing the Tauri IPC boundary.
-      const values = form.getFieldsValue(true)
-      await invoke('save_config', {
-        config: {
-          role: values.role ?? 'server',
-          port: values.port ?? 9527,
-          target_ip: values.target_ip ?? '',
-          target_port: values.target_port ?? 9527,
-          max_file_size: values.max_file_size ?? 104857600,
-          language: 'zh-CN',
-          wechat_enabled: values.wechat_enabled ?? true,
-          wechat_preview_limit: values.wechat_preview_limit ?? 40,
-          wechat_show_content: values.wechat_show_content ?? true,
-          wechat_session_filter: values.wechat_session_filter ?? '',
-          minimize_to_tray: values.minimize_to_tray ?? true,
-          autostart: values.autostart ?? false,
-        },
-      })
-      message.success('配置已保存')
-    } catch (error) {
-      message.error(`保存失败：${error}`)
-    }
-  }
-
-  const handleConnect = async () => {
-    try {
-      const values = await form.validateFields()
-      setLoading(true)
-      if (values.role === 'server') {
-        await invoke('start_server', { port: values.port })
-        message.success('已开始监听连接')
-      } else {
-        await invoke('connect_to_server', { ip: values.target_ip, port: values.target_port })
-        message.success('已开始连接，目标设备上线后会自动重连')
-      }
-    } catch (error) {
-      if (error instanceof Error) message.error(`操作失败：${error.message}`)
+      await invoke('disconnect')
+    } catch (cause) {
+      setError(connectionError(cause))
     } finally {
-      setLoading(false)
+      await onConnectionChange()
+      setBusy(false)
     }
   }
 
-  const handleDisconnect = async () => {
-    await invoke('disconnect')
-    setStatus('disconnected')
-    message.info('连接已断开')
-  }
+  const connect = async () => {
+    setError('')
+    if (role === 'client' && !parsedAddress) {
+      setError('请输入有效的地址，例如 192.168.1.20:9527。')
+      addressInput.current?.focus()
+      return
+    }
+    if (role === 'server' && (port === null || !Number.isInteger(port) || port < 1 || port > 65535)) {
+      setError('请输入 1–65535 之间的监听端口。')
+      return
+    }
 
-  const handleWeChatEnabledChange = async (enabled: boolean) => {
+    setBusy(true)
     try {
-      await invoke('set_wechat_monitor_enabled', { enabled })
-      message.success(enabled ? '微信消息监听已开启' : '微信消息监听已关闭')
-    } catch (error) {
-      form.setFieldValue('wechat_enabled', !enabled)
-      message.error(`切换微信监听失败：${error}`)
+      if (connection?.status === 'connected') {
+        const confirmed = await modal.confirm({
+          title: '切换连接',
+          content: '当前同步将中断，随后使用新的连接设置。',
+          okText: '切换连接',
+          cancelText: '取消',
+        })
+        if (!confirmed) return
+      }
+      if (role === 'server') {
+        await invoke('start_server', { port })
+      } else if (parsedAddress) {
+        await invoke('connect_to_server', parsedAddress)
+      }
+    } catch (cause) {
+      setError(connectionError(cause))
+    } finally {
+      await onConnectionChange()
+      setBusy(false)
     }
   }
+
+  const stopLabel = connection?.status === 'connected'
+    ? '断开连接'
+    : endpoint?.role === 'server' ? '停止等待' : '停止连接'
+  const connectLabel = role === 'server'
+    ? endpoint?.role === 'server' ? '更改监听端口' : active ? '切换到等待' : '开始等待'
+    : active ? '切换并连接' : '连接设备'
 
   return (
-    <div className="config-panel">
-      <div className="config-scroll">
-        <div className="section-kicker">连接设置</div>
-        <Form form={form} layout="vertical" initialValues={{ role: 'server', port: 9527, target_port: 9527, max_file_size: 104857600, wechat_enabled: true, wechat_preview_limit: 40, wechat_show_content: true, wechat_session_filter: '', minimize_to_tray: true, autostart: false }}>
-          <Form.Item name="role" label="运行模式">
-            <Radio.Group className="role-switch">
-              <Radio.Button value="server">接收端</Radio.Button>
-              <Radio.Button value="client">发送端</Radio.Button>
-            </Radio.Group>
-          </Form.Item>
+    <section className="connection-panel">
+      {modalContext}
+      <fieldset className="role-field">
+        <legend>连接方式</legend>
+        <Radio.Group
+          aria-label="连接方式"
+          className="role-switch"
+          value={role}
+          disabled={busy}
+          onChange={event => { setRole(event.target.value); setError('') }}
+        >
+          <Radio.Button value="server">等待另一台连接</Radio.Button>
+          <Radio.Button value="client">连接另一台</Radio.Button>
+        </Radio.Group>
+      </fieldset>
 
-          <Form.Item noStyle shouldUpdate={(previous, current) => previous.role !== current.role}>
-            {({ getFieldValue }) => getFieldValue('role') === 'server' ? (
-              <Form.Item name="port" label="监听端口" rules={[{ required: true, message: '请输入监听端口' }]}>
-                <InputNumber min={1} max={65535} addonBefore="TCP" className="form-control" />
-              </Form.Item>
+      {role === 'server' ? (
+        <div className="address-card">
+          <div className="address-heading">本机连接地址</div>
+          <div className="address-row">
+            {addresses && addresses.length > 1 ? (
+              <Select
+                aria-label="本机连接地址"
+                className="address-select"
+                value={ip}
+                onChange={setSelectedIp}
+                options={addresses.map(value => ({ value, label: addressPort ? value + ':' + addressPort : value }))}
+                getPopupContainer={node => node.parentElement!}
+              />
             ) : (
-              <div className="client-fields">
-                <Form.Item name="target_ip" label="目标 IP" rules={[{ required: true, message: '请输入目标 IP' }]}>
-                  <Input placeholder="例如：192.168.1.100" className="form-control" />
-                </Form.Item>
-                <Form.Item name="target_port" label="目标端口" rules={[{ required: true, message: '请输入目标端口' }]}>
-                  <InputNumber min={1} max={65535} addonBefore="TCP" className="form-control" />
-                </Form.Item>
-              </div>
+              <span className={localAddress ? 'address-value' : 'muted'}>
+                {localAddress || (addresses === null ? '正在读取地址…' : '暂无可用地址')}
+              </span>
             )}
-          </Form.Item>
+            {localAddress ? (
+              <Button onClick={() => void copyAddress()} aria-live="polite">
+                {copiedAddress === localAddress ? '已复制' : '复制地址'}
+              </Button>
+            ) : addresses !== null && (
+              <Button onClick={() => void loadAddresses()}>刷新地址</Button>
+            )}
+          </div>
+          <p className="hint">
+            {endpoint?.role === 'server'
+              ? '在另一台设备上选择「连接另一台」，然后粘贴此地址。'
+              : '开始等待后，在另一台设备上粘贴此地址。'}
+          </p>
+          <details className="port-details">
+            <summary>监听端口</summary>
+            <label htmlFor="listen-port">监听端口</label>
+            <InputNumber
+              id="listen-port"
+              name="port"
+              min={1}
+              max={65535}
+              step={1}
+              precision={0}
+              value={port}
+              disabled={busy}
+              onChange={value => { setPort(value); setError('') }}
+            />
+          </details>
+        </div>
+      ) : (
+        <div className="address-card">
+          <label className="address-heading" htmlFor="target-address">另一台设备的地址</label>
+          <Input
+            ref={addressInput}
+            id="target-address"
+            name="address"
+            value={address}
+            placeholder="例如 192.168.1.20:9527"
+            autoComplete="off"
+            spellCheck={false}
+            disabled={busy}
+            aria-describedby="address-hint"
+            onChange={event => { setAddress(event.target.value); setError('') }}
+            onPressEnter={() => { if (!busy && !sameEndpoint && connection) void connect() }}
+          />
+          <p id="address-hint" className="hint">粘贴对方的连接地址。只输入 IP 时使用端口 {DEFAULT_PORT}。</p>
+        </div>
+      )}
 
-          <Form.Item name="max_file_size" label="文件传输上限">
-            <InputNumber disabled addonAfter="MB" value={100} className="form-control" />
-          </Form.Item>
-          <div className="section-kicker">微信消息提示</div>
-          <Form.Item name="wechat_enabled" label="启用微信消息提示" valuePropName="checked">
-            <Switch onChange={handleWeChatEnabledChange} />
-          </Form.Item>
-          <Form.Item
-            name="wechat_session_filter"
-            label="仅监听指定个人或群"
-            extra="每行填写一个名称关键词，支持模糊匹配；留空表示监听全部"
-          >
-            <Input.TextArea rows={3} placeholder={'例如：\n张三\n项目工作群'} />
-          </Form.Item>
-          <Form.Item name="wechat_preview_limit" label="通知摘要长度">
-            <InputNumber min={1} max={200} addonAfter="字" className="form-control" />
-          </Form.Item>
-          <Form.Item name="wechat_show_content" label="点击后显示完整正文" valuePropName="checked">
-            <Switch />
-          </Form.Item>
-          <Form.Item name="minimize_to_tray" label="关闭或最小化时隐藏到托盘" valuePropName="checked">
-            <Switch />
-          </Form.Item>
-          <Form.Item name="autostart" label="开机自启（启动后最小化）" valuePropName="checked">
-            <Switch />
-          </Form.Item>
-        </Form>
+      {(error || runtimeError) && (
+        <p role="alert" className="action-error">{error || '监听端口暂时无法使用。请检查端口后重试。'}</p>
+      )}
+
+      <div className="connection-actions">
+        <div className="connection-facts">
+          {connection?.status === 'connected' && (connection.peer || endpoint?.role === 'client') && (
+            <span>对端 <strong>{connection.peer ?? (endpoint?.role === 'client' && endpoint.address)}</strong></span>
+          )}
+          {connection?.status === 'connecting' && endpoint?.role === 'client' && <span>目标 {endpoint.address}</span>}
+          <span aria-live="polite" className="last-transfer">{lastTransfer ?? '连接后，复制即可同步'}</span>
+        </div>
+        <div className="connection-buttons">
+          {active && <Button onClick={() => void stop()} disabled={busy}>{stopLabel}</Button>}
+          {!sameEndpoint && (
+            <Button type="primary" disabled={!connection} loading={busy} onClick={() => void connect()}>
+              {connectLabel}
+            </Button>
+          )}
+        </div>
       </div>
-      <footer className="config-actions">
-        <StatusIndicator status={status} />
-        <Space wrap>
-          <Button onClick={handleSave}>保存配置</Button>
-          <Button onClick={handleDisconnect}>断开</Button>
-          <Button type="primary" onClick={handleConnect} loading={loading}>
-            {role === 'server' ? '开始监听' : '连接设备'}
-          </Button>
-        </Space>
-      </footer>
-    </div>
+    </section>
   )
 }
