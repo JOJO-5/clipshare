@@ -5,6 +5,7 @@ pub mod autostart;
 pub mod logger;
 pub mod network;
 pub mod protocol;
+mod updates;
 pub mod wechat;
 pub mod wechat_monitor;
 
@@ -36,7 +37,13 @@ pub fn run() {
     #[cfg(feature = "win7-compat")]
     let builder = tauri::Builder::default();
 
+    #[cfg(windows)]
+    let builder = builder
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .manage(updates::UpdateInstallLock::default());
+
     builder
+        .plugin(tauri_plugin_shell::init())
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
             get_config,
@@ -46,6 +53,12 @@ pub fn run() {
             get_connection_info,
             get_local_addresses,
             copy_local_text,
+            updates::get_update_info,
+            updates::open_release_downloads,
+            #[cfg(windows)]
+            updates::check_for_update,
+            #[cfg(windows)]
+            updates::install_app_update,
             start_server,
             connect_to_server,
             disconnect,

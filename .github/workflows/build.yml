@@ -86,6 +86,7 @@ jobs:
           }
           & .\tests\win7-webview2-config.ps1
           & .\tests\functional-regressions.ps1
+          node --test tests/update-manifest.test.mjs
           cargo test --manifest-path src-tauri/Cargo.toml --lib
 
       - name: Build (Win7)
@@ -141,6 +142,26 @@ jobs:
         run: |
           npm run tauri build -- --target ${{ matrix.target }}
 
+      - name: Sign Windows update installers
+        if: matrix.platform == 'windows-latest' && startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY)) {
+            throw 'The GitHub Actions TAURI_SIGNING_PRIVATE_KEY secret is required for release builds.'
+          }
+          $bundle = 'src-tauri/target/x86_64-pc-windows-msvc/release/bundle'
+          $installers = @(Get-ChildItem -LiteralPath $bundle -File -Recurse |
+            Where-Object { $_.Name -match '_x64(?:-setup\.exe|_en-US\.msi)$' })
+          if (!$installers.Count) {
+            throw 'No Windows update installers were built.'
+          }
+          foreach ($installer in $installers) {
+            & .\node_modules\.bin\tauri.cmd signer sign $installer.FullName
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+
       - name: Upload Win7 artifacts
         if: matrix.win7 == true
         uses: actions/upload-artifact@v4
@@ -171,6 +192,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
@@ -192,6 +217,7 @@ jobs:
             case "$base" in
               clipshare.exe) destination="ClipShare-${artifact}.exe" ;;
               clipshare) destination="ClipShare-${artifact}" ;;
+              'ClipShare Win7_'*) destination="${base/ /.}" ;;
               *) destination="$base" ;;
             esac
             if [[ -e "release-assets/$destination" ]]; then
@@ -214,6 +240,7 @@ jobs:
                 -iname '*.dmg' -o \
                 -iname '*.app.tar.gz' -o \
                 -iname '*.deb' -o \
+                -iname '*.sig' -o \
                 -iname '*.appimage' \
               \) ! -path '*/release/clipshare.exe' -print0
             )
@@ -231,6 +258,8 @@ jobs:
             echo 'No release assets were prepared.' >&2
             exit 1
           fi
+          git for-each-ref --format='%(contents:subject)' "refs/tags/$GITHUB_REF_NAME" > update-notes.txt
+          node scripts/update-manifest.mjs release-assets "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" update-notes.txt
           find release-assets -maxdepth 1 -type f -printf '%f\n' | sort
 
       - name: Create Release

@@ -10,6 +10,7 @@ $wechatMonitor = Get-Content -LiteralPath (Join-Path $repoRoot 'src-tauri\src\we
 $workflow = Get-Content -LiteralPath (Join-Path $repoRoot '.github\workflows\build.yml') -Raw
 $packageJson = Get-Content -LiteralPath (Join-Path $repoRoot 'package.json') -Raw
 $cargoManifest = Get-Content -LiteralPath (Join-Path $repoRoot 'src-tauri\Cargo.toml') -Raw
+$cargoLock = Get-Content -LiteralPath (Join-Path $repoRoot 'src-tauri\Cargo.lock') -Raw
 $lib = Get-Content -LiteralPath (Join-Path $repoRoot 'src-tauri\src\lib.rs') -Raw
 $config = Get-Content -LiteralPath (Join-Path $repoRoot 'src-tauri\src\config.rs') -Raw
 
@@ -142,6 +143,9 @@ if ($workflow -notmatch 'check-win7-imports\.ps1') {
 }
 if ($cargoManifest -notmatch 'webview2-com-sys-0\.38\.2-win7') {
     throw 'Cargo must patch webview2-com-sys to use the loader that supports unpatched Windows 7.'
+}
+if ($cargoLock -match '\[\[patch\.unused\]\]\s+name = "webview2-com-sys"') {
+    throw 'The Windows 7 WebView2 loader patch must be used by the resolved dependencies.'
 }
 if ($lib -notmatch 'restore_saved_connection') {
     throw 'Application startup must restore the saved server/client connection role.'

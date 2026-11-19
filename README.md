@@ -122,6 +122,12 @@ npm run build
 
 默认端口为 `9527`。「开始等待」或「连接设备」会保存角色和地址，ClipShare 下次启动时会自动恢复。如果另一台尚未启动，主动连接的一端会自动重试。防火墙需允许等待端端口的 TCP 入站连接。
 
+## 软件更新
+
+通过 Windows x64 安装包安装的版本会在后台检查 GitHub 正式发布，也可以在「设置 → 软件更新」中手动检查。确认下载后，程序会校验安装包签名，再启动安装程序。Win7、现代 Windows 的 NSIS 和 MSI 各自使用对应的安装包。其他平台和裸可执行文件可以从同一入口打开 GitHub 发布页。
+
+发布时将 `src-tauri/tauri.conf.json` 的版本与标签中的数字版本保持一致。GitHub Actions 使用 `TAURI_SIGNING_PRIVATE_KEY` 签名 Windows 安装包并随发布上传 `latest.json`。应用通过 GitHub 的 `releases/latest` 读取正式更新，因此预发布资产可供手动试装。后续发布沿用与应用内公钥配对的签名密钥。
+
 ## 项目结构
 
 ```text

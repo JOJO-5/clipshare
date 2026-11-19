@@ -8,7 +8,9 @@ import { formatLogTime, LogPanel } from './components/LogPanel'
 import type { LogEntry } from './components/LogPanel'
 import { SettingsPanel } from './components/SettingsPanel'
 import { StatusIndicator } from './components/StatusIndicator'
+import { UpdatePanel } from './components/UpdatePanel'
 import { errorText, type Config, type ConnectionSnapshot } from './connection'
+import { useUpdates } from './updates'
 
 interface WeChatMessage {
   id: string
@@ -75,6 +77,7 @@ function latestClipboardTransfer(logs: LogEntry[]) {
 }
 
 function App() {
+  const updates = useUpdates()
   const [config, setConfig] = useState<Config | null>(null)
   const [configError, setConfigError] = useState('')
   const [connection, setConnection] = useState<ConnectionSnapshot | null>(null)
@@ -367,7 +370,16 @@ function App() {
               ) : configPlaceholder,
             },
             { key: 'log', label: '传输记录', children: <LogPanel logs={logs} onClear={clearLogs} /> },
-            { key: 'settings', label: '设置', children: config ? <SettingsPanel config={config} onChange={updateConfig} /> : configPlaceholder },
+            {
+              key: 'settings',
+              label: updates.status.state === 'available' ? '设置 · 有新版' : '设置',
+              children: (
+                <>
+                  <UpdatePanel updates={updates} />
+                  {config ? <SettingsPanel config={config} onChange={updateConfig} /> : configPlaceholder}
+                </>
+              ),
+            },
           ]}
         />
       </main>
