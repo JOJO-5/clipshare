@@ -147,6 +147,7 @@ jobs:
         shell: pwsh
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
           if ([string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY)) {
             throw 'The GitHub Actions TAURI_SIGNING_PRIVATE_KEY secret is required for release builds.'
@@ -157,8 +158,12 @@ jobs:
           if (!$installers.Count) {
             throw 'No Windows update installers were built.'
           }
+          $passwordArgs = @()
+          if ([string]::IsNullOrEmpty($env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD)) {
+            $passwordArgs = @('--password=')
+          }
           foreach ($installer in $installers) {
-            & .\node_modules\.bin\tauri.cmd signer sign $installer.FullName
+            & .\node_modules\.bin\tauri.cmd signer sign @passwordArgs $installer.FullName
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
 
